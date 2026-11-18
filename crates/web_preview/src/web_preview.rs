@@ -100,15 +100,26 @@ fn appkit_frame(
 }
 
 /// Accepts what people type into a URL bar: a bare host gets `http://`.
+///
+/// Agents navigate through this too, so only web schemes get through: a
+/// `file:` URL would let page script read local files, and `data:` pages run
+/// with whatever origin WebKit gives them.
 fn normalize_url(input: &str) -> Option<String> {
     let input = input.trim();
     if input.is_empty() {
         return None;
     }
-    if input.contains("://") || input.starts_with("about:") || input.starts_with("data:") {
-        Some(input.to_string())
-    } else {
-        Some(format!("http://{input}"))
+    if input.eq_ignore_ascii_case("about:blank") {
+        return Some("about:blank".to_string());
+    }
+    match input.split_once("://") {
+        Some((scheme, _))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            Some(input.to_string())
+        }
+        Some(_) => None,
+        None => Some(format!("http://{input}")),
     }
 }
 
@@ -206,6 +217,13 @@ mod tests {
             Some("https://example.com".to_string())
         );
         assert_eq!(normalize_url("  "), None);
+        assert_eq!(normalize_url("file:///etc/passwd"), None);
+        assert_eq!(normalize_url("FTP://example.com"), None);
+        assert_eq!(normalize_url("About:Blank"), Some("about:blank".to_string()));
+        assert_eq!(
+            normalize_url("data:text/html,hi"),
+            Some("http://data:text/html,hi".to_string())
+        );
     }
 
     #[test]

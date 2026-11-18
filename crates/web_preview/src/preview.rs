@@ -136,7 +136,12 @@ impl WebPreview {
                 let agent_clicked = self
                     .ignore_page_focus_until
                     .is_some_and(|until| Instant::now() < until);
-                if !agent_clicked && !self.focus_handle.is_focused(window) {
+                // Page script can post this message at will, so it only counts once
+                // AppKit has handed the web view the keyboard, which takes a real click.
+                if !agent_clicked
+                    && self.native.has_keyboard()
+                    && !self.focus_handle.is_focused(window)
+                {
                     window.focus(&self.focus_handle, cx);
                 }
             }
