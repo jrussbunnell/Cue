@@ -2,7 +2,7 @@
 > Remove this line to confirm you've reviewed this PR before submitting.
 # Cue
 
-[![Cue tests](https://github.com/jrussbunnell/Cue/actions/workflows/echo_tests.yml/badge.svg?branch=echo)](https://github.com/jrussbunnell/Cue/actions/workflows/echo_tests.yml)
+[![Cue tests](https://github.com/jrussbunnell/Cue/actions/workflows/echo_tests.yml/badge.svg?branch=cue-main)](https://github.com/jrussbunnell/Cue/actions/workflows/echo_tests.yml)
 
 Cue is a personal fork of [Zed](https://github.com/zed-industries/zed) built around working with coding agents by voice. It narrates what agents do, takes spoken instructions, and keeps track of every session and subagent running at once.
 
@@ -35,10 +35,10 @@ Voice features need an Inworld API key (`INWORLD_API_KEY`).
 
 ### Branches
 
-- **`echo`** is the working branch and the default.
+- **`cue-main`** is the working branch and the default.
 - **`main`** mirrors upstream and is not maintained.
 
-`echo` is kept current by merging `upstream/main` into it. Upstream's CI workflows only run in `zed-industries`. The fork's own tests run in [`echo_tests.yml`](./.github/workflows/echo_tests.yml).
+`cue-main` is kept current by merging `upstream/main` into it. Upstream's CI workflows only run in `zed-industries`. The fork's own tests run in [`echo_tests.yml`](./.github/workflows/echo_tests.yml).
 
 ### Licensing
 

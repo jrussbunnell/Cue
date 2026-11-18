@@ -24,7 +24,7 @@ on:
   push:
     branches:
       - main
-      - echo
+      - cue-main
 
 permissions:
   contents: read
