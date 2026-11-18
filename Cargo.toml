@@ -243,6 +243,7 @@ members = [
     "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
+    "crates/web_preview",
     "crates/web_search",
     "crates/web_search_providers",
     "crates/which_key",
@@ -524,6 +525,7 @@ util_macros = { path = "crates/util_macros" }
 vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 watch = { path = "crates/watch" }
+web_preview = { path = "crates/web_preview" }
 web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
 which_key = { path = "crates/which_key" }
@@ -848,6 +850,20 @@ objc2-screen-capture-kit = { version = "=0.3.2", default-features = false, featu
     "std"
 ] }
 objc2-uniform-type-identifiers = { version = "0.3", default-features = false, features = ["std", "UTCoreTypes", "UTType"] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "WKNavigation",
+    "WKScriptMessage",
+    "WKScriptMessageHandler",
+    "WKSnapshotConfiguration",
+    "WKUserContentController",
+    "WKUserScript",
+    "WKWebView",
+    "WKWebViewConfiguration",
+] }
 objc2-user-notifications = { version = "0.3", default-features = false, features = [
     "std",
     "block2",
