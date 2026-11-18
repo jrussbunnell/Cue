@@ -1,50 +1,47 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
-# Zed
+# Cue
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+[![Cue tests](https://github.com/jrussbunnell/Cue/actions/workflows/echo_tests.yml/badge.svg?branch=echo)](https://github.com/jrussbunnell/Cue/actions/workflows/echo_tests.yml)
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+Cue is a personal fork of [Zed](https://github.com/zed-industries/zed) built around working with coding agents by voice. It narrates what agents do, takes spoken instructions, and keeps track of every session and subagent running at once.
+
+It is not affiliated with Zed Industries. For the editor itself, use [Zed](https://zed.dev).
 
 ---
 
-### Installation
+### What Cue adds
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+- **Read-aloud narration.** Speaks agent replies, tool calls, and turn wrap-ups as they happen, with a "catch me up" summary.
+- **Voice mode.** A real-time conversation with the agent through Inworld, voiced by the persona Echo. It can steer, start, approve, and stop sessions, with a wake word and echo cancellation.
+- **Native subagents.** Claude Code subagents run as child sessions with their own threads. You can stop, message, and persist each one without touching its parent.
+- **Fleet view.** Shows the parallel sessions and workflow runs Claude Code already has going, in the sidebar.
+- **Database panel.** Read-only query and table views for MySQL, Postgres, ClickHouse, and Convex, plus tools that let agents use them.
 
-Other platforms are not yet available:
+The design docs live in [`docs/superpowers/specs`](./docs/superpowers/specs).
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+### Building
 
-### Developing Zed
+Cue builds like Zed. Follow the upstream guides for [macOS](./docs/src/development/macos.md), [Linux](./docs/src/development/linux.md), or [Windows](./docs/src/development/windows.md). Then:
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+```sh
+cargo run              # runs the `zedcue` binary
+script/bundle-mac      # builds Cue.app
+```
 
-### Contributing
+Cue installs alongside Zed. It uses its own binary (`zedcue`), URL scheme, data directories, and bundle id (`dev.jrb.ZedCue`). It doesn't use the bare name `cue`, which would clash with the CUE language CLI.
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+Voice features need an Inworld API key (`INWORLD_API_KEY`).
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+### Branches
+
+- **`echo`** is the working branch and the default.
+- **`main`** mirrors upstream and is not maintained.
+
+`echo` is kept current by merging `upstream/main` into it. Upstream's CI workflows only run in `zed-industries`. The fork's own tests run in [`echo_tests.yml`](./.github/workflows/echo_tests.yml).
 
 ### Licensing
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+Like Zed, Cue's source is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked. See the license files in the repository root.
 
-License information for third party dependencies must be correctly provided for CI to pass.
-
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
-
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
-
-## Sponsorship
-
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+Third-party license compliance is checked with [`cargo-about`](https://github.com/EmbarkStudios/cargo-about). Accepted licenses are listed in `script/licenses/zed-licenses.toml`.
