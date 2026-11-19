@@ -988,6 +988,12 @@
       "end": "menu::SelectLast",
     },
   },
+  {
+    "context": "WebPreview",
+    "bindings": {
+      "alt-cmd-i": "web_preview::ToggleInspector",
+    },
+  },
   // Custom bindings
   {
     "use_key_equivalents": true,

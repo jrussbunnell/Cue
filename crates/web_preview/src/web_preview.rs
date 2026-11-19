@@ -20,6 +20,8 @@ gpui::actions!(
         Open,
         /// Opens the web preview's current page in the default browser.
         OpenInBrowser,
+        /// Opens or closes Web Inspector (elements, console, network) for the web preview.
+        ToggleInspector,
     ]
 );
 

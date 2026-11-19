@@ -19,7 +19,7 @@ use zed_actions::web_preview::OpenUrl;
 
 use crate::native::NativeWebView;
 use crate::{
-    ConsoleBuffer, ConsoleEntry, DEFAULT_URL, Open, OpenInBrowser, PageMessage, agent_tools, normalize_url,
+    ConsoleBuffer, ConsoleEntry, DEFAULT_URL, Open, OpenInBrowser, PageMessage, ToggleInspector, agent_tools, normalize_url,
 };
 
 /// Ignore the page's own focus report for this long after an agent click, so
@@ -279,6 +279,10 @@ impl WebPreview {
         self.ignore_page_focus_until = Some(Instant::now() + AGENT_CLICK_FOCUS_GRACE);
     }
 
+    fn toggle_inspector(&mut self, _: &ToggleInspector, _: &mut Window, _: &mut Context<Self>) {
+        self.native.toggle_inspector().log_err();
+    }
+
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.url_editor.read(cx).text(cx);
         if let Some(url) = self.navigate(&text, window, cx).log_err() {
@@ -368,6 +372,7 @@ impl Render for WebPreview {
             .key_context("WebPreview")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::toggle_inspector))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(
@@ -392,6 +397,16 @@ impl Render for WebPreview {
                             .on_click(cx.listener(|this, _, _, _| this.native.reload())),
                     )
                     .child(div().flex_1().child(self.url_editor.clone()))
+                    .child(
+                        IconButton::new("inspector", IconName::Code)
+                            .tooltip(Tooltip::for_action_title(
+                                "Web Inspector",
+                                &ToggleInspector,
+                            ))
+                            .on_click(cx.listener(|this, _, _, _| {
+                                this.native.toggle_inspector().log_err();
+                            })),
+                    )
                     .child(
                         IconButton::new("open-in-browser", IconName::ArrowUpRight)
                             .tooltip(Tooltip::for_action_title(

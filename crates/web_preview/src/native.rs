@@ -9,7 +9,7 @@ use futures::channel::{mpsc, oneshot};
 use gpui::{Bounds, Pixels, Window};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{DefinedClass as _, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{DefinedClass as _, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags, NSEventType, NSImage,
     NSStandardKeyBindingResponding as _, NSView, NSWindow,
@@ -136,6 +136,12 @@ impl NativeWebView {
                 &configuration,
             );
             view.setInspectable(true);
+            // Adds "Inspect Element" to the page's context menu. Private, but
+            // WebKit has kept it stable for years; skipped if it ever goes.
+            let preferences: Retained<NSObject> = msg_send![&*configuration, preferences];
+            if preferences.respondsToSelector(sel!(_setDeveloperExtrasEnabled:)) {
+                let () = msg_send![&*preferences, _setDeveloperExtrasEnabled: true];
+            }
             view.setHidden(true);
             Ok(Self {
                 view,
@@ -167,6 +173,30 @@ impl NativeWebView {
     pub(crate) fn go_forward(&self) {
         // SAFETY: Plain WebKit call on the main thread.
         unsafe { self.view.goForward() };
+    }
+
+    /// Opens Web Inspector in its own window, or closes it. WKWebView has no
+    /// public API for this; `_inspector` is what Safari's Develop menu uses.
+    /// Detached because docking it would resize the view GPUI positions.
+    pub(crate) fn toggle_inspector(&self) -> Result<()> {
+        if !self.view.respondsToSelector(sel!(_inspector)) {
+            bail!("this WebKit version does not expose Web Inspector");
+        }
+        // SAFETY: `_inspector` returns the view's `_WKInspector`, whose
+        // `isVisible`, `show`, `detach` and `close` take and return nothing
+        // unusual; called on the main thread.
+        unsafe {
+            let inspector: Option<Retained<AnyObject>> = msg_send![&*self.view, _inspector];
+            let inspector = inspector.context("the page has no inspector")?;
+            let visible: bool = msg_send![&*inspector, isVisible];
+            if visible {
+                let () = msg_send![&*inspector, close];
+            } else {
+                let () = msg_send![&*inspector, show];
+                let () = msg_send![&*inspector, detach];
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn url(&self) -> Option<String> {
