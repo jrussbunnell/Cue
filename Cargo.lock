@@ -12494,6 +12494,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-web-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2e5aaab980c433cf470df9d7af96a7b46a9d892d521a2cbbb2f8a4c16751e7f"
+dependencies = [
+ "bitflags 2.13.1",
+ "block2 0.6.2",
+ "objc2 0.6.3",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -21231,6 +21245,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "web_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "block2 0.6.2",
+ "collections",
+ "context_server",
+ "editor",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "menu",
+ "objc2 0.6.3",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-web-kit",
+ "project",
+ "raw-window-handle",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "web_search"
 version = "0.1.0"
 dependencies = [
@@ -23388,6 +23431,7 @@ dependencies = [
  "vim",
  "vim_mode_setting",
  "watch",
+ "web_preview",
  "web_search",
  "web_search_providers",
  "which_key",

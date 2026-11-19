@@ -900,6 +900,28 @@ pub mod wsl_actions {
     }
 }
 
+pub mod web_preview {
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    /// Opens a URL in Cue's web preview tab, reusing an open one.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = web_preview)]
+    #[serde(deny_unknown_fields)]
+    pub struct OpenUrl {
+        pub url: String,
+    }
+
+    actions!(
+        web_preview,
+        [
+            /// Opens the newest link printed in a terminal, such as a dev server's address, in the web preview.
+            OpenTerminalLink,
+        ]
+    );
+}
+
 pub mod preview {
     pub mod markdown {
         use gpui::actions;

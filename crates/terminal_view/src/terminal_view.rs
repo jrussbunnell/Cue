@@ -60,7 +60,11 @@ use workspace::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
     },
 };
-use zed_actions::{agent::AddSelectionToThread, assistant::InlineAssist};
+use zed_actions::{
+    agent::AddSelectionToThread,
+    assistant::InlineAssist,
+    web_preview::{OpenTerminalLink, OpenUrl},
+};
 
 struct ImeState {
     marked_text: String,
@@ -112,8 +116,100 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(TerminalView::deploy);
+        workspace.register_action(open_terminal_link);
     })
     .detach();
+}
+
+/// Web links go to Cue's web preview, everything else to the system.
+fn open_url(url: &str, window: &mut Window, cx: &mut App) {
+    if is_web_url(url) {
+        window.dispatch_action(
+            Box::new(OpenUrl {
+                url: url.to_string(),
+            }),
+            cx,
+        );
+    } else {
+        cx.open_url(url);
+    }
+}
+
+fn is_web_url(url: &str) -> bool {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme);
+    scheme.is_some_and(|scheme| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+/// Lines scanned from the bottom of each terminal for a link.
+const TERMINAL_LINK_SCAN_LINES: usize = 300;
+
+fn open_terminal_link(
+    workspace: &mut Workspace,
+    _: &OpenTerminalLink,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    // The terminal panel's active terminal first, then its others, then
+    // terminals in the center.
+    let mut terminals = Vec::new();
+    if let Some(panel) = workspace.panel::<TerminalPanel>(cx) {
+        let panel = panel.read(cx);
+        terminals.extend(
+            panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>()),
+        );
+        for pane in panel.panes() {
+            terminals.extend(pane.read(cx).items_of_type::<TerminalView>());
+        }
+    }
+    terminals.extend(workspace.items_of_type::<TerminalView>(cx));
+    let url = terminals.iter().find_map(|terminal_view| {
+        let lines = terminal_view
+            .read(cx)
+            .terminal()
+            .read(cx)
+            .last_n_non_empty_lines(TERMINAL_LINK_SCAN_LINES);
+        newest_web_link(&lines)
+    });
+    match url {
+        Some(url) => window.dispatch_action(Box::new(OpenUrl { url }), cx),
+        None => workspace.show_toast(
+            workspace::Toast::new(
+                workspace::notifications::NotificationId::unique::<OpenTerminalLink>(),
+                "No http(s) link in the terminal output",
+            )
+            .autohide(),
+            cx,
+        ),
+    }
+}
+
+/// The newest http(s) link in `lines` (oldest first), skipping LAN addresses
+/// such as the "Network:" line dev servers print after their local one.
+// ponytail: "newest link" can pick an app's own log line over the dev server
+// banner; prefer the banner's pattern (Local:/ready) if that bites.
+fn newest_web_link(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        line.split_whitespace().find_map(|word| {
+            let start = word.find("http://").or_else(|| word.find("https://"))?;
+            let url = word[start..]
+                .trim_end_matches(|character: char| ")]}>.,;:'\"`".contains(character));
+            let host = url.split_once("://")?.1;
+            let host = host.split(['/', ':', '?', '#']).next()?;
+            if host.is_empty() {
+                return None;
+            }
+            let is_lan = host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|address| address.is_private() || address.is_link_local());
+            (!is_lan).then(|| url.to_string())
+        })
+    })
 }
 
 pub struct BlockProperties {
@@ -1330,7 +1426,7 @@ fn subscribe_for_terminal_events(
                 }
 
                 Event::Open(maybe_navigation_target) => match maybe_navigation_target {
-                    MaybeNavigationTarget::Url(url) => cx.open_url(url),
+                    MaybeNavigationTarget::Url(url) => open_url(url, window, cx),
                     MaybeNavigationTarget::PathLike(path_like_target) => open_path_like_target(
                         &workspace,
                         terminal_view,
@@ -2329,6 +2425,28 @@ mod tests {
     use util::rel_path::RelPath;
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
+
+    #[test]
+    fn test_newest_web_link() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            newest_web_link(&lines(
+                "  VITE v5  ready\n  ➜  Local:   http://localhost:5173/\n  ➜  Network: http://192.168.1.20:5173/"
+            )),
+            Some("http://localhost:5173/".to_string())
+        );
+        assert_eq!(
+            newest_web_link(&lines(
+                "- Local: http://localhost:3000\ntunnel ready (https://app.joshua.dev.bartrhomes.com)."
+            )),
+            Some("https://app.joshua.dev.bartrhomes.com".to_string())
+        );
+        assert_eq!(newest_web_link(&lines("compiled\nhttp://")), None);
+        assert_eq!(newest_web_link(&lines("no links here")), None);
+        assert!(is_web_url("HTTPS://example.com"));
+        assert!(!is_web_url("mailto:someone@example.com"));
+        assert!(!is_web_url("file:///tmp/a"));
+    }
 
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();
