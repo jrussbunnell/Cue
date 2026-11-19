@@ -596,6 +596,7 @@ impl Source for SqlSource {
 
     async fn apply(&self, changes: &ChangeSet) -> Result<u64> {
         let statements = self.statements(changes, false)?;
+        self.ensure_no_open_transaction().await?;
         self.statement(self.begin()).await?;
         match self.run_changes(changes, &statements).await {
             Ok(affected) => {
@@ -611,6 +612,24 @@ impl Source for SqlSource {
 
     async fn rehearse(&self, changes: &ChangeSet, hold: bool) -> Result<Rehearsal> {
         let statements = self.statements(changes, false)?;
+        if self.kind == DatabaseKind::Mysql {
+            let lasting = self
+                .mysql_non_transactional_tables(&changes.collection)
+                .await?;
+            if !lasting.is_empty() {
+                // A rehearsal there would write for real: these engines
+                // ignore ROLLBACK. Nothing runs until the user approves.
+                return Ok(Rehearsal {
+                    notes: vec![format!(
+                        "Not rehearsed: {} can't roll back a change, so it runs only after you approve.",
+                        lasting.join(", ")
+                    )],
+                    affected: 0,
+                    held: false,
+                });
+            }
+        }
+        self.ensure_no_open_transaction().await?;
         self.statement(self.begin()).await?;
         let counted = self.kind == DatabaseKind::Postgres;
         let result = async {
@@ -838,6 +857,51 @@ impl SqlSource {
                 ))
             })
             .collect())
+    }
+
+    /// Refuses to start a transaction on a session that already has one. The
+    /// session is shared with the query tab, where the user may have run
+    /// `BEGIN`: Postgres would fold ours into theirs and then end both, and
+    /// MySQL would silently commit theirs at our `START TRANSACTION`.
+    async fn ensure_no_open_transaction(&self) -> Result<()> {
+        let open = match self.kind {
+            DatabaseKind::Postgres => self.in_open_transaction().await?,
+            // `SET TRANSACTION` fails while a transaction is in progress,
+            // for any user. Otherwise it only marks the next transaction,
+            // the one about to start, as read-write.
+            _ => match self.statement("SET TRANSACTION READ WRITE").await {
+                Ok(()) => false,
+                Err(error) if format!("{error:#}").contains("transaction is in progress") => true,
+                Err(error) => return Err(error),
+            },
+        };
+        if open {
+            bail!(
+                "This connection's session has an open transaction, probably from a BEGIN in a query tab. Commit or roll it back first; Cue won't end it for you. Nothing was written."
+            );
+        }
+        Ok(())
+    }
+
+    /// Tables a change to `table` could write that ignore ROLLBACK. With
+    /// triggers on `table`, any table in its schema could be written, so all
+    /// of them count.
+    async fn mysql_non_transactional_tables(&self, table: &CollectionRef) -> Result<Vec<String>> {
+        let schema = table.namespace.clone().map_or(Value::Null, Value::Text);
+        let name = Value::Text(table.name.clone());
+        let result = self
+            .rows(
+                "/* cue: tables a rehearsal could not roll back */ \
+                 SELECT CONCAT(TABLE_NAME, ' (', ENGINE, ')') FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_TYPE = 'BASE TABLE' \
+                 AND ENGINE NOT IN ('InnoDB', 'ndbcluster') \
+                 AND (TABLE_NAME = ? OR EXISTS (SELECT 1 FROM information_schema.TRIGGERS \
+                 WHERE EVENT_OBJECT_SCHEMA = COALESCE(?, DATABASE()) AND EVENT_OBJECT_TABLE = ?)) \
+                 ORDER BY 1",
+                &[schema.clone(), name.clone(), schema, name],
+            )
+            .await?;
+        Ok(text_column(&result))
     }
 
     /// A savepoint can only be set inside a transaction block, so whether

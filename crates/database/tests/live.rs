@@ -458,7 +458,7 @@ async fn test_mysql_assess() {
     prod.environment = DatabaseEnvironment::Prod;
     connect(&engine, "prod", prod, "echo").await;
     for statement in [
-        "DROP TABLE IF EXISTS shipment_line, shipment_audit, shipment",
+        "DROP TABLE IF EXISTS shipment_line, shipment_audit, shipment, ledger",
         "CREATE TABLE shipment (id INT PRIMARY KEY, status VARCHAR(16))",
         "CREATE TABLE shipment_audit (shipment_id INT, status VARCHAR(16))",
         "CREATE TABLE shipment_line (id INT, shipment_id INT, \
@@ -546,6 +546,87 @@ async fn test_mysql_assess() {
         "SELECT COUNT(*) FROM shipment_audit",
     )
     .await;
+
+    // MyISAM ignores ROLLBACK, so a rehearsal there would write for real.
+    for statement in [
+        "DROP TABLE IF EXISTS ledger",
+        "CREATE TABLE ledger (id INT PRIMARY KEY, status VARCHAR(16)) ENGINE = MyISAM",
+        "INSERT INTO ledger VALUES (1, 'paid')",
+    ] {
+        query(&engine, "prod", statement, false).await.unwrap();
+    }
+    let ledger = CollectionRef::new(Some("echo_test"), "ledger");
+    let (notes, token) = rehearse(&engine, "prod", ship(&ledger, 1), true).await;
+    assert_eq!(token, None);
+    assert!(
+        notes[0].starts_with("Not rehearsed: ledger (MyISAM)"),
+        "{notes:?}"
+    );
+    let status = query(
+        &engine,
+        "prod",
+        "SELECT status FROM ledger WHERE id = 1",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status.rows[0][0], Value::Text("paid".into()), "nothing ran");
+    // `shipment` has a trigger, so any MyISAM table in the schema could be
+    // written by it; with `ledger` around, its rehearsals are skipped too.
+    let (notes, _) = rehearse(&engine, "prod", ship(&shipment, 1), true).await;
+    assert!(
+        notes[0].starts_with("Not rehearsed: ledger (MyISAM)"),
+        "{notes:?}"
+    );
+    query(&engine, "prod", "DROP TABLE ledger", false)
+        .await
+        .unwrap();
+
+    exercise_open_transaction_guard(
+        &engine,
+        "prod",
+        &shipment,
+        "INSERT INTO shipment_audit VALUES (0, 'mine')",
+        "SELECT COUNT(*) FROM shipment_audit WHERE status = 'mine'",
+    )
+    .await;
+}
+
+/// Writes refuse to run on a session where the user left a transaction
+/// open, and leave that transaction as it was.
+async fn exercise_open_transaction_guard(
+    engine: &Engine,
+    name: &str,
+    table: &CollectionRef,
+    mine: &str,
+    count_mine: &str,
+) {
+    query(engine, name, "BEGIN", false).await.unwrap();
+    query(engine, name, mine, false).await.unwrap();
+    let error = apply(engine, name, ship(table, 3)).await.unwrap_err();
+    assert!(error.to_string().contains("open transaction"), "{error}");
+    let error = engine
+        .handle(Request::Rehearse {
+            connection: name.into(),
+            changes: ship(table, 3),
+            hold: true,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("open transaction"), "{error}");
+    let rows = query(engine, name, count_mine, false).await.unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Int(1),
+        "the user's transaction is intact"
+    );
+    query(engine, name, "ROLLBACK", false).await.unwrap();
+    let rows = query(engine, name, count_mine, false).await.unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Int(0),
+        "and still the user's to end"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -703,6 +784,14 @@ async fn test_postgres_prod_safety() {
         "prod",
         &shipment,
         "SELECT count(*) FROM shipment_audit",
+    )
+    .await;
+    exercise_open_transaction_guard(
+        &engine,
+        "prod",
+        &shipment,
+        "INSERT INTO shipment_audit VALUES (0, 'mine')",
+        "SELECT count(*) FROM shipment_audit WHERE status = 'mine'",
     )
     .await;
 }
