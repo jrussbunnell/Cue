@@ -18,6 +18,8 @@ gpui::actions!(
     [
         /// Opens a web preview tab at http://localhost:3000.
         Open,
+        /// Opens the web preview's current page in the default browser.
+        OpenInBrowser,
     ]
 );
 

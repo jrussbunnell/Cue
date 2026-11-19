@@ -19,7 +19,7 @@ use zed_actions::web_preview::OpenUrl;
 
 use crate::native::NativeWebView;
 use crate::{
-    ConsoleBuffer, ConsoleEntry, DEFAULT_URL, Open, PageMessage, agent_tools, normalize_url,
+    ConsoleBuffer, ConsoleEntry, DEFAULT_URL, Open, OpenInBrowser, PageMessage, agent_tools, normalize_url,
 };
 
 /// Ignore the page's own focus report for this long after an agent click, so
@@ -30,6 +30,15 @@ pub(crate) fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &Open, window, cx| {
             WebPreview::open(workspace, DEFAULT_URL, window, cx).notify_err(workspace, cx);
+        });
+        workspace.register_action(|workspace, _: &OpenInBrowser, _, cx| {
+            // The focused preview if there is one, else any open one.
+            let preview = workspace
+                .active_item_as::<WebPreview>(cx)
+                .or_else(|| workspace.items_of_type::<WebPreview>(cx).next());
+            if let Some(url) = preview.and_then(|preview| preview.read(cx).native.url()) {
+                cx.open_url(&url);
+            }
         });
         workspace.register_action(|workspace, action: &OpenUrl, window, cx| {
             open_in_preview(workspace, &action.url, window, cx).notify_err(workspace, cx);
@@ -385,12 +394,13 @@ impl Render for WebPreview {
                     .child(div().flex_1().child(self.url_editor.clone()))
                     .child(
                         IconButton::new("open-in-browser", IconName::ArrowUpRight)
-                            .tooltip(Tooltip::text("Open in Browser"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(url) = this.native.url() {
-                                    cx.open_url(&url);
-                                }
-                            })),
+                            .tooltip(Tooltip::for_action_title(
+                                "Open in Browser",
+                                &OpenInBrowser,
+                            ))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenInBrowser), cx)
+                            }),
                     ),
             )
             .child(div().flex_1().min_h_0().w_full().child(content))
