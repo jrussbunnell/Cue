@@ -8,13 +8,14 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use gpui::{
     App, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, Image, ImageFormat,
-    MouseDownEvent, Render, SharedString, Task, Window, canvas, img,
+    MouseDownEvent, Render, RenderImage, SharedString, Task, Window, canvas, img,
 };
 use ui::{IconButton, IconName, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};
 use workspace::notifications::NotifyResultExt as _;
+use zed_actions::web_preview::OpenUrl;
 
 use crate::native::NativeWebView;
 use crate::{
@@ -30,6 +31,9 @@ pub(crate) fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &Open, window, cx| {
             WebPreview::open(workspace, DEFAULT_URL, window, cx).notify_err(workspace, cx);
         });
+        workspace.register_action(|workspace, action: &OpenUrl, window, cx| {
+            open_in_preview(workspace, &action.url, window, cx).notify_err(workspace, cx);
+        });
         if let Some(window) = window {
             agent_tools::register(workspace, window, cx);
         }
@@ -37,13 +41,36 @@ pub(crate) fn init(cx: &mut App) {
     .detach();
 }
 
+/// Loads `url` in the open preview, or opens one, and brings it to the front.
+fn open_in_preview(
+    workspace: &mut Workspace,
+    url: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Result<()> {
+    let Some(preview) = workspace.items_of_type::<WebPreview>(cx).next() else {
+        WebPreview::open(workspace, url, window, cx)?;
+        return Ok(());
+    };
+    preview.update(cx, |preview, cx| preview.navigate(url, window, cx))?;
+    workspace.activate_item(&preview, true, true, window, cx);
+    Ok(())
+}
+
 enum Overlay {
     None,
     /// A modal opened; the page stays live until its snapshot is ready.
     Capturing,
     /// The native view is hidden and this image is drawn in its place, so
-    /// GPUI overlays can draw on top of it.
-    Snapshot(Option<Arc<Image>>),
+    /// GPUI overlays can draw on top of it. The image is decoded up front so
+    /// it paints in the same frame it appears; `settled` stays false for that
+    /// frame, during which the live page still covers it, so the page is
+    /// only hidden once the image is already on screen. Otherwise the page
+    /// flashes blank while it is swapped out.
+    Snapshot {
+        image: Option<Arc<RenderImage>>,
+        settled: bool,
+    },
 }
 
 pub(crate) struct WebPreview {
@@ -85,9 +112,9 @@ impl WebPreview {
                 cx.observe_in(
                     &modal_layer,
                     window,
-                    |this: &mut Self, modal_layer, _, cx| {
+                    |this: &mut Self, modal_layer, window, cx| {
                         let has_modal = modal_layer.read(cx).has_active_modal();
-                        this.modal_changed(has_modal, cx);
+                        this.modal_changed(has_modal, window, cx);
                     },
                 ),
             ];
@@ -161,16 +188,18 @@ impl WebPreview {
         }
     }
 
-    fn modal_changed(&mut self, has_modal: bool, cx: &mut Context<Self>) {
+    fn modal_changed(&mut self, has_modal: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !has_modal {
             match std::mem::replace(&mut self.overlay, Overlay::None) {
                 Overlay::None => {}
-                Overlay::Snapshot(Some(image)) => {
-                    // Every snapshot is a new image; drop it from GPUI's cache.
-                    gpui::ImageSource::Image(image).remove_asset(cx);
+                Overlay::Snapshot {
+                    image: Some(image), ..
+                } => {
+                    // Every snapshot is a new image; free its atlas space.
+                    cx.drop_image(image, Some(window));
                     cx.notify();
                 }
-                Overlay::Capturing | Overlay::Snapshot(None) => cx.notify(),
+                Overlay::Capturing | Overlay::Snapshot { image: None, .. } => cx.notify(),
             }
             return;
         }
@@ -179,9 +208,15 @@ impl WebPreview {
         }
         self.overlay = Overlay::Capturing;
         let snapshot = self.native.snapshot();
+        let svg_renderer = cx.svg_renderer();
         cx.spawn(async move |this, cx| {
             let image = match snapshot.await {
-                Ok(Ok(png)) => Some(Arc::new(Image::from_bytes(ImageFormat::Png, png))),
+                Ok(Ok(png)) => cx
+                    .background_spawn(async move {
+                        Image::from_bytes(ImageFormat::Png, png).to_image_data(svg_renderer)
+                    })
+                    .await
+                    .log_err(),
                 Ok(Err(error)) => {
                     log::error!("snapshotting the web preview: {error:#}");
                     None
@@ -191,7 +226,10 @@ impl WebPreview {
             this.update(cx, |this, cx| {
                 // The modal may have closed while WebKit was rendering.
                 if matches!(this.overlay, Overlay::Capturing) {
-                    this.overlay = Overlay::Snapshot(image);
+                    this.overlay = Overlay::Snapshot {
+                        image,
+                        settled: false,
+                    };
                     cx.notify();
                 }
             })
@@ -270,38 +308,53 @@ impl Item for WebPreview {
 }
 
 impl Render for WebPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match &self.overlay {
-            Overlay::Snapshot(Some(image)) => img(image.clone()).size_full().into_any_element(),
-            Overlay::Snapshot(None) => div()
-                .size_full()
-                .bg(cx.theme().colors().editor_background)
-                .into_any_element(),
-            Overlay::None | Overlay::Capturing => {
-                let native = self.native.clone();
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, (), window, _| {
-                        let visible = bounds.intersect(&window.content_mask().bounds);
-                        if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
-                            native.hide();
-                            return;
-                        }
-                        let Some(token) = native.show(visible, window).log_err() else {
-                            return;
-                        };
-                        // Any mouse down GPUI sees landed outside the page.
-                        window.on_mouse_event(move |_: &MouseDownEvent, phase, _, _| {
-                            if phase == DispatchPhase::Capture {
-                                token.release_keyboard();
-                            }
-                        });
-                    },
-                )
-                .size_full()
-                .into_any_element()
-            }
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (snapshot, show_live) = match &self.overlay {
+            Overlay::None | Overlay::Capturing => (None, true),
+            Overlay::Snapshot { image, settled } => (image.clone(), !settled),
         };
+        if let Overlay::Snapshot { settled: false, .. } = self.overlay {
+            cx.on_next_frame(window, |this, _, cx| {
+                if let Overlay::Snapshot { settled, .. } = &mut this.overlay {
+                    *settled = true;
+                    cx.notify();
+                }
+            });
+        }
+        let native = self.native.clone();
+        let content = div()
+            .size_full()
+            .relative()
+            .when_some(snapshot, |this, image| {
+                this.child(img(image).absolute().top_0().left_0().size_full())
+            })
+            .when(show_live, |this| {
+                this.child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, (), window, _| {
+                            let visible = bounds.intersect(&window.content_mask().bounds);
+                            if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
+                                native.hide();
+                                return;
+                            }
+                            let Some(token) = native.show(visible, window).log_err() else {
+                                return;
+                            };
+                            // Any mouse down GPUI sees landed outside the page.
+                            window.on_mouse_event(move |_: &MouseDownEvent, phase, _, _| {
+                                if phase == DispatchPhase::Capture {
+                                    token.release_keyboard();
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+            });
         v_flex()
             .key_context("WebPreview")
             .track_focus(&self.focus_handle)
@@ -315,11 +368,30 @@ impl Render for WebPreview {
                     .border_b_1()
                     .border_color(cx.theme().colors().border_variant)
                     .child(
+                        IconButton::new("back", IconName::ArrowLeft)
+                            .tooltip(Tooltip::text("Back"))
+                            .on_click(cx.listener(|this, _, _, _| this.native.go_back())),
+                    )
+                    .child(
+                        IconButton::new("forward", IconName::ArrowRight)
+                            .tooltip(Tooltip::text("Forward"))
+                            .on_click(cx.listener(|this, _, _, _| this.native.go_forward())),
+                    )
+                    .child(
                         IconButton::new("reload", IconName::RotateCw)
                             .tooltip(Tooltip::text("Reload"))
                             .on_click(cx.listener(|this, _, _, _| this.native.reload())),
                     )
-                    .child(div().flex_1().child(self.url_editor.clone())),
+                    .child(div().flex_1().child(self.url_editor.clone()))
+                    .child(
+                        IconButton::new("open-in-browser", IconName::ArrowUpRight)
+                            .tooltip(Tooltip::text("Open in Browser"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(url) = this.native.url() {
+                                    cx.open_url(&url);
+                                }
+                            })),
+                    ),
             )
             .child(div().flex_1().min_h_0().w_full().child(content))
     }

@@ -62,8 +62,16 @@ pub fn init(cx: &mut gpui::App) {
     preview::init(cx);
 }
 
+/// Without a native web view, links go to the system browser.
 #[cfg(not(target_os = "macos"))]
-pub fn init(_: &mut gpui::App) {}
+pub fn init(cx: &mut gpui::App) {
+    cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
+        workspace.register_action(|_, action: &zed_actions::web_preview::OpenUrl, _, cx| {
+            cx.open_url(&action.url);
+        });
+    })
+    .detach();
+}
 
 /// A rectangle in an AppKit view's coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq)]

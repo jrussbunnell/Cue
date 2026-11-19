@@ -93,6 +93,8 @@ pub(crate) fn register(
         });
         server.add_tool(Navigate(context.clone()));
         server.add_tool(Click(context.clone()));
+        server.add_tool(Type(context.clone()));
+        server.add_tool(Evaluate(context.clone()));
         server.add_tool(Screenshot(context.clone()));
         server.add_tool(Console(context.clone()));
         let socket = server.socket_path().to_string_lossy().to_string();
@@ -269,45 +271,135 @@ impl McpServerTool for Click {
 
     async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
         let preview = self.0.visible_preview(cx).await?;
-        let selector = serde_json::to_string(&input.selector)?;
-        let script = format!(
-            "(() => {{ const element = document.querySelector({selector}); \
-             if (!element) return JSON.stringify({{ error: 'no element matches' }}); \
-             element.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }}); \
-             const rect = element.getBoundingClientRect(); \
-             return JSON.stringify({{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, \
-               tag: element.tagName.toLowerCase(), text: (element.innerText || element.value || '').slice(0, 80) }}); }})()"
-        );
-        let result = preview
-            .read_with(cx, |preview, _| preview.native().evaluate(&script))
-            .await
-            .map_err(|_| anyhow!("the preview closed"))??;
-        #[derive(Deserialize)]
-        struct Target {
-            error: Option<String>,
-            x: Option<f64>,
-            y: Option<f64>,
-            tag: Option<String>,
-            text: Option<String>,
-        }
-        let target: Target = serde_json::from_str(&result)?;
-        if let Some(error) = target.error {
-            bail!("{error}: {}", input.selector);
-        }
-        let (x, y) = target
-            .x
-            .zip(target.y)
-            .context("the page returned no position")?;
+        Ok(text(click_selector(&preview, &input.selector, cx).await?))
+    }
+}
+
+/// Clicks the element's center with real mouse events and describes what was clicked.
+async fn click_selector(
+    preview: &Entity<WebPreview>,
+    selector: &str,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    let selector_json = serde_json::to_string(selector)?;
+    let script = format!(
+        "const element = document.querySelector({selector_json}); \
+         if (!element) return JSON.stringify({{ error: 'no element matches' }}); \
+         element.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }}); \
+         const rect = element.getBoundingClientRect(); \
+         return JSON.stringify({{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, \
+           tag: element.tagName.toLowerCase(), text: (element.innerText || element.value || '').slice(0, 80) }});"
+    );
+    let result = preview
+        .read_with(cx, |preview, _| preview.native().evaluate(&script))
+        .await
+        .map_err(|_| anyhow!("the preview closed"))??;
+    #[derive(Deserialize)]
+    struct Target {
+        error: Option<String>,
+        x: Option<f64>,
+        y: Option<f64>,
+        tag: Option<String>,
+        text: Option<String>,
+    }
+    let target: Target = serde_json::from_str(&result)?;
+    if let Some(error) = target.error {
+        bail!("{error}: {selector}");
+    }
+    let (x, y) = target
+        .x
+        .zip(target.y)
+        .context("the page returned no position")?;
+    preview.update(cx, |preview, _| {
+        preview.ignore_page_focus_briefly();
+        preview.native().click(x, y)
+    })?;
+    Ok(format!(
+        "Clicked <{}> \"{}\" at ({x:.0}, {y:.0})",
+        target.tag.unwrap_or_default(),
+        target.text.unwrap_or_default().trim()
+    ))
+}
+
+#[derive(Clone)]
+struct Type(ToolContext);
+
+/// Clicks the element matching a CSS selector to focus it, then types text into it as real keyboard text input (trusted input events, so frameworks like React see it). Text is inserted at the cursor; it does not clear the field first.
+#[derive(Deserialize, JsonSchema)]
+struct TypeInput {
+    /// CSS selector of the field to type into, as for document.querySelector.
+    selector: String,
+    text: String,
+    /// Press Return after typing, e.g. to submit a form or search.
+    #[serde(default)]
+    submit: bool,
+}
+
+impl McpServerTool for Type {
+    type Input = TypeInput;
+    type Output = ();
+    const NAME: &'static str = "browser_type";
+
+    fn annotations(&self) -> ToolAnnotations {
+        annotations("Type into the preview", false)
+    }
+
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let preview = self.0.visible_preview(cx).await?;
+        let clicked = click_selector(&preview, &input.selector, cx).await?;
         preview.update(cx, |preview, _| {
             preview.ignore_page_focus_briefly();
-            preview.native().click(x, y)
+            preview.native().type_text(&input.text, input.submit)
         })?;
         Ok(text(format!(
-            "Clicked <{}> \"{}\" at ({x:.0}, {y:.0})",
-            target.tag.unwrap_or_default(),
-            target.text.unwrap_or_default().trim()
+            "{clicked}, typed {} characters{}",
+            input.text.chars().count(),
+            if input.submit { " and pressed Return" } else { "" }
         )))
     }
+}
+
+#[derive(Clone)]
+struct Evaluate(ToolContext);
+
+/// Runs JavaScript in the web preview's page as the body of an async function: use `await` freely and `return` a value, which comes back JSON-encoded. Use it for anything the other tools don't cover: reading the DOM, choosing <select> options, hovering, waiting for an element or for data to load.
+#[derive(Deserialize, JsonSchema)]
+struct EvaluateInput {
+    /// Function body, e.g. `await new Promise(r => setTimeout(r, 500)); return document.title;`
+    script: String,
+}
+
+impl McpServerTool for Evaluate {
+    type Input = EvaluateInput;
+    type Output = ();
+    const NAME: &'static str = "browser_evaluate";
+
+    fn annotations(&self) -> ToolAnnotations {
+        annotations("Run JavaScript in the preview", false)
+    }
+
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let (preview, _, _) = self
+            .0
+            .find_preview(cx)
+            .context("no web preview is open; call browser_navigate first")?;
+        let body = evaluate_body(&input.script);
+        let result = preview
+            .read_with(cx, |preview, _| preview.native().evaluate(&body))
+            .await
+            .map_err(|_| anyhow!("the preview closed"))??;
+        Ok(text(result))
+    }
+}
+
+/// Wraps the agent's script so whatever it returns comes back as JSON text,
+/// and a thrown error comes back as text rather than WebKit's opaque error.
+fn evaluate_body(script: &str) -> String {
+    format!(
+        "try {{ const value = await (async () => {{ {script}\n }})(); \
+         const json = JSON.stringify(value); return json === undefined ? 'undefined' : json; }} \
+         catch (error) {{ return 'Error: ' + (error && error.stack || String(error)); }}"
+    )
 }
 
 #[derive(Clone)]

@@ -12,14 +12,14 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass as _, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags, NSEventType, NSImage,
-    NSView,
+    NSStandardKeyBindingResponding as _, NSView, NSWindow,
 };
 use objc2_foundation::{
     NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize,
     NSString, NSURL, NSURLRequest,
 };
 use objc2_web_kit::{
-    WKScriptMessage, WKScriptMessageHandler, WKSnapshotConfiguration, WKUserContentController,
+    WKContentWorld, WKScriptMessage, WKScriptMessageHandler, WKSnapshotConfiguration, WKUserContentController,
     WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -159,6 +159,16 @@ impl NativeWebView {
         unsafe { self.view.reload() };
     }
 
+    pub(crate) fn go_back(&self) {
+        // SAFETY: Plain WebKit call on the main thread.
+        unsafe { self.view.goBack() };
+    }
+
+    pub(crate) fn go_forward(&self) {
+        // SAFETY: Plain WebKit call on the main thread.
+        unsafe { self.view.goForward() };
+    }
+
     pub(crate) fn url(&self) -> Option<String> {
         // SAFETY: Plain WebKit call on the main thread.
         unsafe { self.view.URL() }
@@ -252,9 +262,17 @@ impl NativeWebView {
         window.makeFirstResponder(gpui_view.as_deref().map(|view| view.as_ref()));
     }
 
-    /// Evaluates `script` in the page. The script must produce a string.
-    pub(crate) fn evaluate(&self, script: &str) -> oneshot::Receiver<Result<String>> {
+    /// Runs `body` as the body of an async function in the page, so it can
+    /// `await`, and resolves with what it returns, which must be a string.
+    pub(crate) fn evaluate(&self, body: &str) -> oneshot::Receiver<Result<String>> {
         let (sender, receiver) = oneshot::channel();
+        let mtm = match main_thread() {
+            Ok(mtm) => mtm,
+            Err(error) => {
+                sender.send(Err(error)).ok();
+                return receiver;
+            }
+        };
         let sender = Cell::new(Some(sender));
         let block = RcBlock::new(move |result: *mut AnyObject, error: *mut NSError| {
             let Some(sender) = sender.take() else {
@@ -274,10 +292,17 @@ impl NativeWebView {
             };
             sender.send(outcome).ok();
         });
-        // SAFETY: The block matches WebKit's completion handler signature.
+        // SAFETY: The block matches WebKit's completion handler signature;
+        // called on the main thread.
         unsafe {
             self.view
-                .evaluateJavaScript_completionHandler(&NSString::from_str(script), Some(&block))
+                .callAsyncJavaScript_arguments_inFrame_inContentWorld_completionHandler(
+                    &NSString::from_str(body),
+                    None,
+                    None,
+                    &WKContentWorld::pageWorld(mtm),
+                    Some(&block),
+                )
         };
         receiver
     }
@@ -323,13 +348,7 @@ impl NativeWebView {
     /// back to whoever had it, so an agent clicking never steals the user's
     /// typing.
     pub(crate) fn click(&self, x: f64, y: f64) -> Result<()> {
-        if self.view.isHidden() {
-            bail!("the preview is not on screen (another tab or a modal is in front of it)");
-        }
-        let window = self
-            .view
-            .window()
-            .context("the preview is not in a window")?;
+        let window = self.on_screen_window()?;
         let bounds = self.view.bounds();
         // SAFETY: Plain WebKit call on the main thread.
         let zoom = unsafe { self.view.pageZoom() };
@@ -369,6 +388,56 @@ impl NativeWebView {
             window.sendEvent(&event);
         }
         window.makeFirstResponder(previous_responder.as_deref());
+        Ok(())
+    }
+}
+
+impl NativeWebView {
+    fn on_screen_window(&self) -> Result<Retained<NSWindow>> {
+        if self.view.isHidden() {
+            bail!("the preview is not on screen (another tab or a modal is in front of it)");
+        }
+        self.view.window().context("the preview is not in a window")
+    }
+
+    /// Types `text` into the page's focused element as real text input, then
+    /// presses Return if `submit`. Like [`Self::click`], keyboard focus goes
+    /// back to whoever had it.
+    pub(crate) fn type_text(&self, text: &str, submit: bool) -> Result<()> {
+        let window = self.on_screen_window()?;
+        let previous_responder = window.firstResponder();
+        window.makeFirstResponder(Some(&self.view));
+        // SAFETY: WKWebView takes an NSString here; called on the main thread.
+        unsafe { self.view.insertText(&NSString::from_str(text)) };
+        let result = if submit {
+            self.press_return(&window)
+        } else {
+            Ok(())
+        };
+        window.makeFirstResponder(previous_responder.as_deref());
+        result
+    }
+
+    fn press_return(&self, window: &NSWindow) -> Result<()> {
+        const RETURN_KEY_CODE: u16 = 36;
+        let timestamp = NSProcessInfo::processInfo().systemUptime();
+        let characters = NSString::from_str("\r");
+        for (event_type, offset) in [(NSEventType::KeyDown, 0.0), (NSEventType::KeyUp, 0.02)] {
+            let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                event_type,
+                NSPoint::new(0., 0.),
+                NSEventModifierFlags::empty(),
+                timestamp + offset,
+                window.windowNumber(),
+                None,
+                &characters,
+                &characters,
+                false,
+                RETURN_KEY_CODE,
+            )
+            .context("AppKit refused to create the key event")?;
+            window.sendEvent(&event);
+        }
         Ok(())
     }
 }
