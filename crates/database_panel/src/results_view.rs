@@ -271,34 +271,47 @@ impl ResultsView {
                 let kind = self.kind(cx).unwrap_or(DatabaseKind::Mysql);
                 let needs_confirmation = self.environment(cx) == DatabaseEnvironment::Prod
                     && !is_reading_statement(kind, &text);
-                let approval = needs_confirmation.then(|| {
-                    self.ask(
-                        Approval {
-                            title: format!("Run a writing statement on {}?", self.connection)
-                                .into(),
-                            subtitle: Some("This connection is tagged prod.".into()),
-                            detail: text.clone(),
-                            confirm_label: "Run".into(),
-                            environment: DatabaseEnvironment::Prod,
-                        },
-                        window,
-                        cx,
-                    )
-                });
                 let connection = self.connection.clone();
                 let store = self.store.clone();
+                let workspace = self.workspace.clone();
+                let assessment = needs_confirmation.then(|| {
+                    store.update(cx, |store, cx| store.assess(&connection, text.clone(), cx))
+                });
                 self.status = Status::Running;
                 let started = Instant::now();
-                self.task = Some(cx.spawn(async move |this, cx| {
-                    if let Some(approval) = approval
-                        && !approval.await.unwrap_or(false)
-                    {
-                        this.update(cx, |this, cx| {
-                            this.status = Status::Idle;
-                            cx.notify();
-                        })
-                        .log_err();
-                        return;
+                self.task = Some(cx.spawn_in(window, async move |this, cx| {
+                    if let Some(assessment) = assessment {
+                        let notes = assessment.await.unwrap_or_else(|error| {
+                            vec![format!("Could not assess this statement: {error:#}")]
+                        });
+                        let approval = workspace.update_in(cx, |workspace, window, cx| {
+                            ApprovalModal::ask(
+                                workspace,
+                                Approval {
+                                    title: format!("Run a writing statement on {connection}?")
+                                        .into(),
+                                    subtitle: Some("This connection is tagged prod.".into()),
+                                    detail: text.clone(),
+                                    notes,
+                                    confirm_label: "Run".into(),
+                                    environment: DatabaseEnvironment::Prod,
+                                },
+                                window,
+                                cx,
+                            )
+                        });
+                        let approved = match approval {
+                            Ok(approval) => approval.await.unwrap_or(false),
+                            Err(_) => false,
+                        };
+                        if !approved {
+                            this.update(cx, |this, cx| {
+                                this.status = Status::Idle;
+                                cx.notify();
+                            })
+                            .log_err();
+                            return;
+                        }
                     }
                     let task = store.update(cx, |store, cx| {
                         store.query(&connection, text, QUERY_LIMIT, false, cx)
@@ -421,20 +434,6 @@ impl ResultsView {
             return;
         };
         self.load_page(cursor, cx);
-    }
-
-    fn ask(
-        &self,
-        approval: Approval,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> futures::channel::oneshot::Receiver<bool> {
-        match self.workspace.upgrade() {
-            Some(workspace) => workspace.update(cx, |workspace, cx| {
-                ApprovalModal::ask(workspace, approval, window, cx)
-            }),
-            None => futures::channel::oneshot::channel().1,
-        }
     }
 
     fn row_count(&self) -> usize {
@@ -644,16 +643,26 @@ impl ResultsView {
             if self.deleted.contains(&row) {
                 continue;
             }
-            let mut set = self
+            let mut edits = self
                 .pending
                 .iter()
                 .filter(|((pending_row, _), _)| *pending_row == row)
-                .map(|((_, index), value)| (results.columns[*index].name.clone(), value.clone()))
+                .map(|((_, index), value)| (*index, value.clone()))
                 .collect::<Vec<_>>();
-            set.sort_by(|left, right| left.0.cmp(&right.0));
+            edits.sort_by_key(|(index, _)| *index);
+            let name = |index: usize| results.columns[index].name.clone();
             changes.push(Change::Update {
                 key: key_for(row)?,
-                set,
+                // The values as read, so the update is refused if another
+                // session changed them in the meantime.
+                expected: edits
+                    .iter()
+                    .map(|(index, _)| (name(*index), self.original(row, *index)))
+                    .collect(),
+                set: edits
+                    .into_iter()
+                    .map(|(index, value)| (name(index), value))
+                    .collect(),
             });
         }
         let mut deleted = self.deleted.iter().copied().collect::<Vec<_>>();
@@ -696,19 +705,30 @@ impl ResultsView {
             store.render_changes(&connection, changes.clone(), cx)
         });
         let workspace = self.workspace.clone();
+        let collection = changes.collection.clone();
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
+            let fail = |error: anyhow::Error, cx: &mut gpui::AsyncWindowContext| {
+                this.update(cx, |this, cx| {
+                    this.status = Status::Failed(format!("{error:#}").into());
+                    cx.notify();
+                })
+                .log_err();
+            };
             let preview = match preview.await {
                 Ok(preview) => preview,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.status = Status::Failed(format!("{error:#}").into());
-                        cx.notify();
-                    })
-                    .log_err();
-                    return;
-                }
+                Err(error) => return fail(error, cx),
             };
-            let Ok(approval) = workspace.update_in(cx, |workspace, window, cx| {
+            // A stale or missing row fails here, before the user is asked,
+            // and the edits stay staged. Where the engine holds the
+            // rehearsal's transaction, approving commits exactly it.
+            let rehearsal = store.update(cx, |store, cx| {
+                store.rehearse(&connection, changes.clone(), true, cx)
+            });
+            let (notes, token) = match rehearsal.await {
+                Ok(rehearsal) => rehearsal,
+                Err(error) => return fail(error, cx),
+            };
+            let approval = workspace.update_in(cx, |workspace, window, cx| {
                 ApprovalModal::ask(
                     workspace,
                     Approval {
@@ -720,20 +740,42 @@ impl ResultsView {
                         subtitle: (environment == DatabaseEnvironment::Prod)
                             .then(|| "This connection is tagged prod.".into()),
                         detail: preview,
+                        notes,
                         confirm_label: "Apply".into(),
                         environment,
                     },
                     window,
                     cx,
                 )
-            }) else {
-                return;
+            });
+            let approved = match approval {
+                Ok(approval) => approval.await.unwrap_or(false),
+                Err(_) => false,
             };
-            if !approval.await.unwrap_or(false) {
-                return;
-            }
-            let apply = store.update(cx, |store, cx| store.apply(&connection, changes, cx));
-            let result = apply.await;
+            let result = match (approved, token) {
+                (true, Some(token)) => {
+                    store
+                        .update(cx, |store, cx| {
+                            store.settle(&connection, collection, token, true, cx)
+                        })
+                        .await
+                }
+                (true, None) => {
+                    store
+                        .update(cx, |store, cx| store.apply(&connection, changes, cx))
+                        .await
+                }
+                (false, Some(token)) => {
+                    store
+                        .update(cx, |store, cx| {
+                            store.settle(&connection, collection, token, false, cx)
+                        })
+                        .await
+                        .log_err();
+                    return;
+                }
+                (false, None) => return,
+            };
             this.update(cx, |this, cx| match result {
                 Ok(_) => {
                     let cursor = match &this.mode {

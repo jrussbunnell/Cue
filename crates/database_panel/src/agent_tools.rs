@@ -24,6 +24,7 @@ use gpui::{
 use project::project_settings::ContextServerSettings;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::modals::{Approval, ApprovalModal};
@@ -353,6 +354,7 @@ impl McpServerTool for ListConnections {
                         "kind": database::kind_name(entry.spec.kind),
                         "environment": format!("{:?}", entry.environment).to_lowercase(),
                         "agent_access": format!("{:?}", entry.agent_access).to_lowercase(),
+                        "policy": policy(entry),
                         "state": state,
                         "query": if entry.spec.kind == DatabaseKind::Convex { "browse tables with filters" } else { "SQL" },
                     })
@@ -459,6 +461,7 @@ impl McpServerTool for Query {
                                         .into(),
                                 ),
                                 detail: sql.clone(),
+                                notes: Vec::new(),
                                 confirm_label: "Run".into(),
                                 environment: entry.environment,
                             },
@@ -485,6 +488,7 @@ impl McpServerTool for Query {
                                     format!("{:?}", entry.environment).to_lowercase().into(),
                                 ),
                                 detail: description.clone(),
+                                notes: Vec::new(),
                                 confirm_label: "Read".into(),
                                 environment: entry.environment,
                             },
@@ -585,6 +589,7 @@ impl McpServerTool for Compare {
                                 format!("{:?}", entry.environment).to_lowercase().into(),
                             ),
                             detail: format!("{source:?}"),
+                            notes: Vec::new(),
                             confirm_label: "Read".into(),
                             environment: entry.environment,
                         },
@@ -721,6 +726,7 @@ impl McpServerTool for Write {
                     "update" => Change::Update {
                         key: assignments(&change.key),
                         set: assignments(&change.values),
+                        expected: Vec::new(),
                     },
                     "delete" => Change::Delete {
                         key: assignments(&change.key),
@@ -742,33 +748,87 @@ impl McpServerTool for Write {
             .await?;
         // Agent writes are always approved: in Echo with the exact statements
         // (`preview`), or by the agent's own permission prompt (`prompt`).
-        if entry.write_approval == DatabaseWriteApproval::Preview {
-            self.0
-                .approve(
-                    Approval {
-                        title: format!("Let the agent change {}?", entry.name).into(),
-                        subtitle: Some(
-                            format!(
-                                "{:?} · {} change(s)",
-                                entry.environment,
-                                changes.changes.len()
-                            )
-                            .to_lowercase()
-                            .into(),
-                        ),
-                        detail: preview.clone(),
-                        confirm_label: "Apply".into(),
-                        environment: entry.environment,
-                    },
-                    cx,
-                )
+        if entry.write_approval != DatabaseWriteApproval::Preview {
+            let count = store
+                .update(cx, |store, cx| store.apply(&input.connection, changes, cx))
                 .await?;
+            return Ok(text(format!("Applied {count} change(s):\n{preview}")));
         }
-        let count = store
-            .update(cx, |store, cx| store.apply(&input.connection, changes, cx))
+        // Rehearsing first catches a missing or changed row before the user
+        // is asked and shows what triggers and cascades do. Where the engine
+        // can hold the rehearsal's transaction, approving commits it, so what
+        // the user saw is exactly what is written.
+        let collection = changes.collection.clone();
+        let (notes, token) = store
+            .update(cx, |store, cx| {
+                store.rehearse(&input.connection, changes.clone(), true, cx)
+            })
             .await?;
+        let approval = self
+            .0
+            .approve(
+                Approval {
+                    title: format!("Let the agent change {}?", entry.name).into(),
+                    subtitle: Some(
+                        format!(
+                            "{:?} · {} change(s)",
+                            entry.environment,
+                            changes.changes.len()
+                        )
+                        .to_lowercase()
+                        .into(),
+                    ),
+                    detail: preview.clone(),
+                    notes,
+                    confirm_label: "Apply".into(),
+                    environment: entry.environment,
+                },
+                cx,
+            )
+            .await;
+        let count = match (approval, token) {
+            (Ok(()), Some(token)) => {
+                store
+                    .update(cx, |store, cx| {
+                        store.settle(&input.connection, collection, token, true, cx)
+                    })
+                    .await?
+            }
+            (Ok(()), None) => {
+                store
+                    .update(cx, |store, cx| store.apply(&input.connection, changes, cx))
+                    .await?
+            }
+            (Err(error), token) => {
+                if let Some(token) = token {
+                    store
+                        .update(cx, |store, cx| {
+                            store.settle(&input.connection, collection, token, false, cx)
+                        })
+                        .await
+                        .log_err();
+                }
+                return Err(error);
+            }
+        };
         Ok(text(format!("Applied {count} change(s):\n{preview}")))
     }
+}
+
+/// What agents may do with a connection, in one line.
+fn policy(entry: &ConnectionEntry) -> String {
+    let reads = match entry.agent_access {
+        DatabaseAgentAccess::Allow => "reads structure and rows freely",
+        _ => "reads structure freely; asks the user before reading rows",
+    };
+    let writes = match (entry.spec.read_only, entry.write_approval) {
+        (true, _) => "never writes",
+        (false, DatabaseWriteApproval::Preview) => {
+            "writes only after the user approves the exact, rehearsed statements"
+        }
+        (false, DatabaseWriteApproval::Prompt) => "writes after your permission prompt",
+    };
+    format!("{reads}; {writes}")
 }
 
 fn read_only_annotations(title: &str) -> ToolAnnotations {

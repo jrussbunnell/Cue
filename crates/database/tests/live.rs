@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use database::{
     BrowseRequest, Capability, Change, ChangeSet, CollectionRef, CompareOptions, CompareSide,
-    ConnectionSpec, DatabaseKind, Engine, Filter, FilterOp, Request, Response, ResultSet, Value,
-    compare,
+    ConnectionSpec, DatabaseEnvironment, DatabaseKind, Engine, Filter, FilterOp, Request, Response,
+    ResultSet, Value, compare,
 };
 
 fn enabled() -> bool {
@@ -28,6 +28,7 @@ fn spec(kind: DatabaseKind, port: u16, user: &str) -> ConnectionSpec {
         url: None,
         ssl_mode: Some("disable".into()),
         read_only: false,
+        environment: DatabaseEnvironment::Dev,
     }
 }
 
@@ -41,6 +42,7 @@ fn http_spec(kind: DatabaseKind, url: &str, user: Option<&str>) -> ConnectionSpe
         url: Some(url.into()),
         ssl_mode: None,
         read_only: false,
+        environment: DatabaseEnvironment::Dev,
     }
 }
 
@@ -270,6 +272,7 @@ async fn exercise_sql(kind: DatabaseKind, port: u16, namespace: &str) {
         changes: vec![Change::Update {
             key: vec![("id".into(), Value::Int(2))],
             set: vec![("phone".into(), Value::Text("it's 5".into()))],
+            expected: vec![],
         }],
     };
     let Response::Text(preview) = engine
@@ -293,6 +296,51 @@ async fn exercise_sql(kind: DatabaseKind, port: u16, namespace: &str) {
     .await
     .unwrap();
     assert_eq!(phone.rows[0][0], Value::Text("it's 5".into()));
+
+    // An edit made against a stale read must not overwrite the newer value.
+    let edit = |expected: &str, new: &str| ChangeSet {
+        collection: seller.clone(),
+        changes: vec![Change::Update {
+            key: vec![("id".into(), Value::Int(2))],
+            set: vec![("phone".into(), Value::Text(new.into()))],
+            expected: vec![("phone".into(), Value::Text(expected.into()))],
+        }],
+    };
+    let error = apply(&engine, "admin", edit("stale", "lost"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed after it was read"),
+        "{error}"
+    );
+    let phone = query(
+        &engine,
+        "admin",
+        "SELECT phone FROM seller WHERE id = 2",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(phone.rows[0][0], Value::Text("it's 5".into()));
+    assert_eq!(
+        apply(&engine, "admin", edit("it's 5", "it's 6"))
+            .await
+            .unwrap(),
+        1
+    );
+    let error = apply(
+        &engine,
+        "admin",
+        ChangeSet {
+            collection: seller.clone(),
+            changes: vec![Change::Delete {
+                key: vec![("id".into(), Value::Int(999))],
+            }],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("no longer exists"), "{error}");
 
     assert!(
         apply(
@@ -334,6 +382,7 @@ async fn test_mysql() {
             changes: vec![Change::Update {
                 key: vec![("name".into(), Value::Text("dup".into()))],
                 set: vec![("color".into(), Value::Text("green".into()))],
+                expected: vec![],
             }],
         },
     )
@@ -390,6 +439,402 @@ async fn test_postgres() {
     query(&engine, "admin", "SELECT COUNT(*) FROM canary", false)
         .await
         .expect("the canary table survives");
+}
+
+async fn notes(engine: &Engine, request: Request) -> Vec<String> {
+    match engine.handle(request).await.unwrap() {
+        Response::Notes(notes) => notes,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mysql_assess() {
+    if !enabled() {
+        return;
+    }
+    let engine = engine();
+    let mut prod = spec(DatabaseKind::Mysql, 13306, "root");
+    prod.environment = DatabaseEnvironment::Prod;
+    connect(&engine, "prod", prod, "echo").await;
+    for statement in [
+        "DROP TABLE IF EXISTS shipment_line, shipment_audit, shipment",
+        "CREATE TABLE shipment (id INT PRIMARY KEY, status VARCHAR(16))",
+        "CREATE TABLE shipment_audit (shipment_id INT, status VARCHAR(16))",
+        "CREATE TABLE shipment_line (id INT, shipment_id INT, \
+         FOREIGN KEY (shipment_id) REFERENCES shipment(id) ON DELETE CASCADE)",
+        "INSERT INTO shipment VALUES (1, 'paid'), (2, 'paid'), (3, 'open')",
+        "CREATE TRIGGER shipment_audit AFTER UPDATE ON shipment FOR EACH ROW \
+         INSERT INTO shipment_audit VALUES (NEW.id, NEW.status)",
+    ] {
+        query(&engine, "prod", statement, false).await.unwrap();
+    }
+    let assess = |text: &str| Request::Assess {
+        connection: "prod".into(),
+        text: text.into(),
+    };
+    let update = notes(
+        &engine,
+        assess("UPDATE shipment SET status = 'shipped' WHERE status = 'paid'"),
+    )
+    .await;
+    assert!(
+        update[0].starts_with("MySQL expects to examine about")
+            && update[0].contains(" of shipment to find the rows to update"),
+        "{update:?}"
+    );
+    assert!(
+        update
+            .iter()
+            .any(|note| note == "Fires 1 trigger on shipment: shipment_audit."),
+        "{update:?}"
+    );
+    let delete = notes(&engine, assess("DELETE FROM shipment")).await;
+    assert!(delete[0].contains("no WHERE clause"), "{delete:?}");
+    assert!(
+        delete.iter().any(|note| note
+            == "Each deleted row also deletes the rows that reference it in shipment_line."),
+        "{delete:?}"
+    );
+    let add = notes(&engine, assess("ALTER TABLE shipment ADD COLUMN note TEXT")).await;
+    assert!(add[0].starts_with("Changes only metadata"), "{add:?}");
+    let retype = notes(
+        &engine,
+        assess("ALTER TABLE `echo_test`.`shipment` MODIFY status TEXT"),
+    )
+    .await;
+    assert!(
+        retype[0].starts_with("Likely copies shipment ("),
+        "{retype:?}"
+    );
+
+    // Nothing changed, and the session's lock wait is back to normal.
+    let state = query(
+        &engine,
+        "prod",
+        "SELECT (SELECT COUNT(*) FROM shipment WHERE status = 'paid'), \
+         (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() \
+         AND TABLE_NAME = 'shipment' AND COLUMN_NAME = 'note'), @@SESSION.lock_wait_timeout, \
+         @@SESSION.innodb_lock_wait_timeout",
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state.rows[0],
+        [
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(31536000),
+            Value::Int(10)
+        ]
+    );
+
+    let shipment = CollectionRef::new(Some("echo_test"), "shipment");
+    let (rehearsal, _) = rehearse(&engine, "prod", ship(&shipment, 1), false).await;
+    assert_eq!(
+        rehearsal,
+        [
+            "Rehearsed and rolled back: 1 row in echo_test.shipment.",
+            "Fires 1 trigger on shipment: shipment_audit.",
+        ]
+    );
+    exercise_held_rehearsal(
+        &engine,
+        "prod",
+        &shipment,
+        "SELECT COUNT(*) FROM shipment_audit",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_postgres_prod_safety() {
+    if !enabled() {
+        return;
+    }
+    let engine = engine();
+    let mut prod = spec(DatabaseKind::Postgres, 15432, "postgres");
+    prod.environment = DatabaseEnvironment::Prod;
+    connect(&engine, "prod", prod, "echo").await;
+    let settings = query(
+        &engine,
+        "prod",
+        "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
+         current_setting('idle_in_transaction_session_timeout'), current_setting('application_name')",
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settings.rows[0],
+        ["10s", "15min", "10min", "Cue"].map(|value| Value::Text(value.into()))
+    );
+
+    for statement in [
+        "DROP TABLE IF EXISTS shipment, shipment_audit, shipment_line CASCADE",
+        "CREATE TABLE shipment (id int PRIMARY KEY, total numeric(10,2), status text)",
+        "CREATE TABLE shipment_audit (shipment_id int, status text)",
+        "CREATE TABLE shipment_line (id int, shipment_id int REFERENCES shipment(id) ON DELETE CASCADE)",
+        "INSERT INTO shipment SELECT g, g, 'paid' FROM generate_series(1, 500) g",
+        "CREATE OR REPLACE FUNCTION shipment_audit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO shipment_audit VALUES (NEW.id, NEW.status); RETURN NEW; END $$",
+        "CREATE TRIGGER shipment_audit AFTER UPDATE ON shipment FOR EACH ROW EXECUTE FUNCTION shipment_audit()",
+        "ANALYZE shipment",
+    ] {
+        query(&engine, "prod", statement, false).await.unwrap();
+    }
+    let assess = |text: &str| Request::Assess {
+        connection: "prod".into(),
+        text: text.into(),
+    };
+
+    let update = notes(
+        &engine,
+        assess("UPDATE shipment SET status = 'shipped' WHERE status = 'paid'"),
+    )
+    .await;
+    assert!(
+        update[0].starts_with("Updates about 500 rows in public.shipment"),
+        "{update:?}"
+    );
+    assert!(
+        update.iter().any(|note| note.contains("shipment_audit")),
+        "{update:?}"
+    );
+    let delete = notes(&engine, assess("DELETE FROM shipment")).await;
+    assert!(delete[0].contains("no WHERE clause"), "{delete:?}");
+    assert!(
+        delete
+            .iter()
+            .any(|note| note.contains("deletes the rows that reference it in shipment_line")),
+        "{delete:?}"
+    );
+    let widen = notes(
+        &engine,
+        assess("ALTER TABLE shipment ALTER COLUMN total TYPE numeric(12,2)"),
+    )
+    .await;
+    assert_eq!(
+        widen,
+        ["Changes only the catalog; shipment is not rewritten."]
+    );
+    let retype = notes(
+        &engine,
+        assess("ALTER TABLE public.shipment ALTER COLUMN total TYPE float8"),
+    )
+    .await;
+    assert!(
+        retype[0].starts_with("Rewrites public.shipment ("),
+        "{retype:?}"
+    );
+    assert!(retype[0].contains("rebuilds its index"), "{retype:?}");
+
+    // Assessing never changes anything.
+    let state = query(
+        &engine,
+        "prod",
+        "SELECT format_type(atttypid, atttypmod), (SELECT count(*) FROM shipment WHERE status = 'paid') \
+         FROM pg_attribute WHERE attrelid = 'shipment'::regclass AND attname = 'total'",
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state.rows[0],
+        [Value::Text("numeric(10,2)".into()), Value::Int(500)]
+    );
+
+    // Inside the user's own transaction, assessing must not end it.
+    query(&engine, "prod", "BEGIN", false).await.unwrap();
+    query(
+        &engine,
+        "prod",
+        "INSERT INTO shipment_audit VALUES (0, 'mine')",
+        false,
+    )
+    .await
+    .unwrap();
+    let inside = notes(
+        &engine,
+        assess("UPDATE shipment SET status = 'x' WHERE id = 1"),
+    )
+    .await;
+    assert_eq!(
+        inside,
+        ["This session has an open transaction, so the impact was not estimated."]
+    );
+    let mine = query(
+        &engine,
+        "prod",
+        "SELECT count(*) FROM shipment_audit",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mine.rows[0][0],
+        Value::Int(1),
+        "the user's transaction is intact"
+    );
+    query(&engine, "prod", "ROLLBACK", false).await.unwrap();
+
+    let shipment = CollectionRef::new(Some("public"), "shipment");
+    let (rehearsal, token) = rehearse(&engine, "prod", ship(&shipment, 1), false).await;
+    assert_eq!(token, None);
+    assert_eq!(
+        rehearsal,
+        [
+            "Rehearsed and rolled back: 1 row in public.shipment.",
+            "Also 1 row inserted in public.shipment_audit (triggers or foreign keys).",
+        ]
+    );
+    let audit = query(&engine, "prod", "SELECT count(*) FROM shipment_audit", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit.rows[0][0],
+        Value::Int(0),
+        "the rehearsal was rolled back"
+    );
+
+    exercise_held_rehearsal(
+        &engine,
+        "prod",
+        &shipment,
+        "SELECT count(*) FROM shipment_audit",
+    )
+    .await;
+}
+
+fn ship(table: &CollectionRef, id: i64) -> ChangeSet {
+    ChangeSet {
+        collection: table.clone(),
+        changes: vec![Change::Update {
+            key: vec![("id".into(), Value::Int(id))],
+            set: vec![("status".into(), Value::Text("shipped".into()))],
+            expected: vec![],
+        }],
+    }
+}
+
+async fn rehearse(
+    engine: &Engine,
+    name: &str,
+    changes: ChangeSet,
+    hold: bool,
+) -> (Vec<String>, Option<u64>) {
+    match engine
+        .handle(Request::Rehearse {
+            connection: name.into(),
+            changes,
+            hold,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Rehearsed { notes, token } => (notes, token),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+async fn settle(engine: &Engine, name: &str, token: u64, commit: bool) -> anyhow::Result<u64> {
+    match engine
+        .handle(Request::Settle {
+            connection: name.into(),
+            token,
+            commit,
+        })
+        .await?
+    {
+        Response::Applied(count) => Ok(count),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A held rehearsal keeps its transaction until it is settled: approving
+/// commits exactly what was rehearsed, rejecting leaves nothing behind, and
+/// the connection refuses other work meanwhile instead of hanging.
+async fn exercise_held_rehearsal(engine: &Engine, name: &str, table: &CollectionRef, audit: &str) {
+    let audited = async || {
+        let rows = query(engine, name, audit, false).await.unwrap();
+        rows.rows[0][0].clone()
+    };
+    let before = audited().await;
+
+    let (notes, token) = rehearse(engine, name, ship(table, 2), true).await;
+    let token = token.expect("SQL rehearsals can be held");
+    assert!(notes[0].starts_with("Rehearsed: 1 row in "), "{notes:?}");
+    let busy = query(engine, name, "SELECT 1", true).await.unwrap_err();
+    assert!(busy.to_string().contains("waiting for approval"), "{busy}");
+    assert_eq!(settle(engine, name, token, false).await.unwrap(), 0);
+    assert_eq!(
+        audited().await,
+        before,
+        "rejecting rolled the rehearsal back"
+    );
+    let stale = settle(engine, name, token, true).await.unwrap_err();
+    assert!(stale.to_string().contains("expired"), "{stale}");
+
+    let (_, token) = rehearse(engine, name, ship(table, 2), true).await;
+    assert_eq!(settle(engine, name, token.unwrap(), true).await.unwrap(), 1);
+    let status = query(
+        engine,
+        name,
+        &format!("SELECT status FROM {} WHERE id = 2", table.name),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status.rows[0][0], Value::Text("shipped".into()));
+    assert_ne!(
+        audited().await,
+        before,
+        "the approved change and its trigger committed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_held_rehearsal_expires() {
+    if !enabled() {
+        return;
+    }
+    let engine = engine().with_held_rehearsal_timeout(std::time::Duration::from_millis(300));
+    connect(
+        &engine,
+        "admin",
+        spec(DatabaseKind::Postgres, 15432, "postgres"),
+        "echo",
+    )
+    .await;
+    let seller = CollectionRef::new(Some("public"), "seller");
+    let change = ChangeSet {
+        collection: seller,
+        changes: vec![Change::Update {
+            key: vec![("id".into(), Value::Int(3))],
+            set: vec![("phone".into(), Value::Text("expired".into()))],
+            expected: vec![],
+        }],
+    };
+    let (_, token) = rehearse(&engine, "admin", change, true).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let error = settle(&engine, "admin", token.unwrap(), true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("expired"), "{error}");
+    let phone = query(
+        &engine,
+        "admin",
+        "SELECT phone FROM seller WHERE id = 3",
+        false,
+    )
+    .await
+    .expect("the connection is free again");
+    assert_eq!(
+        phone.rows[0][0],
+        Value::Text("555".into()),
+        "the expired rehearsal rolled back"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -475,6 +920,58 @@ async fn test_clickhouse() {
     )
     .await;
     assert_eq!(page.rows.rows.len(), 2);
+
+    // Stale edits are refused before any mutation runs.
+    let events = CollectionRef::new(Some("default"), "events");
+    let edit = |expected: &str, new: &str| ChangeSet {
+        collection: events.clone(),
+        changes: vec![Change::Update {
+            key: vec![("id".into(), Value::Int(3))],
+            set: vec![("kind".into(), Value::Text(new.into()))],
+            expected: vec![("kind".into(), Value::Text(expected.into()))],
+        }],
+    };
+    let error = apply(&engine, "admin", edit("stale", "lost"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed after it was read"),
+        "{error}"
+    );
+    assert_eq!(
+        apply(&engine, "admin", edit("signup", "renamed"))
+            .await
+            .unwrap(),
+        1
+    );
+    let kind = query(
+        &engine,
+        "admin",
+        "SELECT kind FROM default.events WHERE id = 3",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(kind.rows[0][0], Value::Text("renamed".into()));
+    assert_eq!(
+        apply(&engine, "admin", edit("renamed", "signup"))
+            .await
+            .unwrap(),
+        1
+    );
+    let error = apply(
+        &engine,
+        "admin",
+        ChangeSet {
+            collection: events.clone(),
+            changes: vec![Change::Delete {
+                key: vec![("id".into(), Value::Int(999))],
+            }],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("no longer exists"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -524,6 +1021,7 @@ async fn test_convex() {
         changes: vec![Change::Update {
             key: vec![("_id".into(), id.clone())],
             set: vec![("email".into(), Value::Text("b2@x.com".into()))],
+            expected: vec![],
         }],
     };
     assert_eq!(apply(&engine, "atlas", changes).await.unwrap(), 1);
@@ -542,6 +1040,38 @@ async fn test_convex() {
     .await;
     let email = after.rows.column_index("email").unwrap();
     assert_eq!(after.rows.rows[0][email], Value::Text("b2@x.com".into()));
+
+    // A stale edit is refused; one made against the current value applies.
+    let edit = |expected: &str, new: &str| ChangeSet {
+        collection: links.clone(),
+        changes: vec![Change::Update {
+            key: vec![(
+                "_id".into(),
+                after.rows.rows[0][after.rows.column_index("_id").unwrap()].clone(),
+            )],
+            set: vec![("email".into(), Value::Text(new.into()))],
+            expected: vec![("email".into(), Value::Text(expected.into()))],
+        }],
+    };
+    let error = apply(&engine, "atlas", edit("stale@x.com", "lost@x.com"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed after it was read"),
+        "{error}"
+    );
+    assert_eq!(
+        apply(&engine, "atlas", edit("b2@x.com", "b3@x.com"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        apply(&engine, "atlas", edit("b3@x.com", "b2@x.com"))
+            .await
+            .unwrap(),
+        1
+    );
 
     // History: walk the snapshot, then deltas.
     let mut cursor = None;

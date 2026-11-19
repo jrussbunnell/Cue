@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::{
     BrowseRequest, Capability, Change, ChangeSet, Collection, CollectionKind, CollectionRef,
     CollectionSchema, Column, Field, Filter, FilterOp, Page, QueryLanguage, ResultSet, Source,
-    Value,
+    Value, checkable,
 };
 
 /// ClickHouse over its HTTP interface, either directly or through a query
@@ -214,28 +214,38 @@ impl ClickHouseSource {
         Ok(serde_json::from_str(&body).ok())
     }
 
-    fn statements(&self, changes: &ChangeSet) -> Result<Vec<(String, Option<String>)>> {
+    fn statements(&self, changes: &ChangeSet) -> Result<Vec<Planned>> {
         let table = table_name(&changes.collection);
         changes
             .changes
             .iter()
             .map(|change| {
                 Ok(match change {
-                    Change::Update { key, set } => {
+                    Change::Update { key, set, expected } => {
                         anyhow::ensure!(
                             !key.is_empty() && !set.is_empty(),
                             "an update needs a key and fields"
                         );
-                        let condition = key_condition(key);
+                        let mut guard = key.clone();
+                        guard.extend(comparable(&checkable(expected)));
+                        let mut landed = key.clone();
+                        landed.extend(comparable(set));
                         let assignments = set
                             .iter()
                             .map(|(field, value)| format!("{} = {}", quote(field), literal(value)))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        (
-                            format!("ALTER TABLE {table} UPDATE {assignments} WHERE {condition}"),
-                            Some(condition),
-                        )
+                        // The old values go into the mutation's own WHERE, so a
+                        // stale edit matches nothing even if the row changes
+                        // after the checks below.
+                        let guard = key_condition(&guard);
+                        Planned {
+                            sql: format!("ALTER TABLE {table} UPDATE {assignments} WHERE {guard}"),
+                            key: Some(key_condition(key)),
+                            guard: Some(guard),
+                            landed: Some(key_condition(&landed)),
+                            row: describe_key(key),
+                        }
                     }
                     Change::Insert { values } => {
                         anyhow::ensure!(!values.is_empty(), "an insert needs fields");
@@ -247,27 +257,77 @@ impl ClickHouseSource {
                             .iter()
                             .map(|(_, value)| literal(value))
                             .collect::<Vec<_>>();
-                        (
-                            format!(
+                        Planned {
+                            sql: format!(
                                 "INSERT INTO {table} ({}) VALUES ({})",
                                 fields.join(", "),
                                 literals.join(", ")
                             ),
-                            None,
-                        )
+                            key: None,
+                            guard: None,
+                            landed: None,
+                            row: String::new(),
+                        }
                     }
                     Change::Delete { key } => {
                         anyhow::ensure!(!key.is_empty(), "a delete needs a key");
                         let condition = key_condition(key);
-                        (
-                            format!("DELETE FROM {table} WHERE {condition}"),
-                            Some(condition),
-                        )
+                        Planned {
+                            sql: format!("DELETE FROM {table} WHERE {condition}"),
+                            key: Some(condition.clone()),
+                            guard: Some(condition),
+                            landed: None,
+                            row: describe_key(key),
+                        }
                     }
                 })
             })
             .collect()
     }
+
+    async fn count(&self, table: &str, condition: &str) -> Result<u64> {
+        let count = self
+            .run(
+                &format!("SELECT count() FROM {table} WHERE {condition}"),
+                &[],
+            )
+            .await?;
+        Ok(count
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .map(|value| value.display().parse::<u64>().unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX))
+    }
+}
+
+/// One change as ClickHouse runs it, with the conditions that check it.
+struct Planned {
+    sql: String,
+    /// Selects the row by key.
+    key: Option<String>,
+    /// The key plus the values the change expects to find.
+    guard: Option<String>,
+    /// The key plus the new values, true once an update has landed.
+    landed: Option<String>,
+    row: String,
+}
+
+/// Values that compare reliably with `=`. A `Float32` column never equals the
+/// `Float64` literal of the value it printed, so floats are left out.
+fn comparable(values: &[(String, Value)]) -> Vec<(String, Value)> {
+    values
+        .iter()
+        .filter(|(_, value)| !matches!(value, Value::Float(_)))
+        .cloned()
+        .collect()
+}
+
+fn describe_key(key: &[(String, Value)]) -> String {
+    key.iter()
+        .map(|(field, value)| format!("{field} {}", value.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl From<Meta> for Column {
@@ -470,7 +530,7 @@ impl Source for ClickHouseSource {
         Ok(self
             .statements(changes)?
             .iter()
-            .map(|(sql, _)| format!("{sql};"))
+            .map(|planned| format!("{};", planned.sql))
             .collect::<Vec<_>>()
             .join("\n"))
     }
@@ -482,31 +542,39 @@ impl Source for ClickHouseSource {
         let table = table_name(&changes.collection);
         let statements = self.statements(changes)?;
         // ClickHouse has no transactions and mutations report no row counts,
-        // so check every key matches at most one row before changing anything.
-        for (_, condition) in &statements {
-            if let Some(condition) = condition {
-                let count = self
-                    .run(
-                        &format!("SELECT count() FROM {table} WHERE {condition}"),
-                        &[],
-                    )
-                    .await?;
-                let matches = count
-                    .rows
-                    .first()
-                    .and_then(|row| row.first())
-                    .map(|value| value.display().parse::<u64>().unwrap_or(u64::MAX))
-                    .unwrap_or(u64::MAX);
-                if matches > 1 {
-                    bail!(
-                        "refusing to change {table}: `{condition}` matches {matches} rows, not one"
-                    );
-                }
+        // so check every change before running any, and each update after.
+        for planned in &statements {
+            let (Some(key), Some(guard)) = (&planned.key, &planned.guard) else {
+                continue;
+            };
+            let matches = self.count(&table, key).await?;
+            if matches == 0 {
+                bail!(
+                    "Not saved: the row with {} no longer exists. Nothing was written.",
+                    planned.row
+                );
+            }
+            if matches > 1 {
+                bail!("refusing to change {table}: `{key}` matches {matches} rows, not one");
+            }
+            if guard != key && self.count(&table, guard).await? == 0 {
+                bail!(
+                    "Not saved: the row with {} changed after it was read; another session saved a new value where this change would write. Nothing was written. Reload to see the current values.",
+                    planned.row
+                );
             }
         }
-        for (sql, _) in &statements {
-            self.run(sql, &[("mutations_sync", "2".to_string())])
+        for (index, planned) in statements.iter().enumerate() {
+            self.run(&planned.sql, &[("mutations_sync", "2".to_string())])
                 .await?;
+            if let Some(landed) = &planned.landed
+                && self.count(&table, landed).await? == 0
+            {
+                bail!(
+                    "The row with {} changed while saving, so this change did not apply. ClickHouse has no transactions: the {index} change(s) before it were saved and stay.",
+                    planned.row
+                );
+            }
         }
         Ok(statements.len() as u64)
     }

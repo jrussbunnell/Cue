@@ -19,6 +19,7 @@ pub struct ApprovalModal {
     title: SharedString,
     subtitle: Option<SharedString>,
     detail: Entity<Editor>,
+    notes: Vec<SharedString>,
     confirm_label: SharedString,
     environment: DatabaseEnvironment,
     response: Option<oneshot::Sender<bool>>,
@@ -29,6 +30,8 @@ pub struct Approval {
     pub title: SharedString,
     pub subtitle: Option<SharedString>,
     pub detail: String,
+    /// What running it would do: warnings, estimates, rehearsal results.
+    pub notes: Vec<String>,
     pub confirm_label: SharedString,
     pub environment: DatabaseEnvironment,
 }
@@ -54,6 +57,7 @@ impl ApprovalModal {
                 title: approval.title,
                 subtitle: approval.subtitle,
                 detail,
+                notes: approval.notes.into_iter().map(SharedString::from).collect(),
                 confirm_label: approval.confirm_label,
                 environment: approval.environment,
                 response: Some(sender),
@@ -70,8 +74,11 @@ impl ApprovalModal {
         cx.emit(DismissEvent);
     }
 
+    /// On prod, Enter rejects: approving takes a deliberate click, so a
+    /// reflexive keypress can't run something destructive.
     fn confirm(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut gpui::Context<Self>) {
-        self.respond(true, cx);
+        let approved = self.environment != DatabaseEnvironment::Prod;
+        self.respond(approved, cx);
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -129,6 +136,26 @@ impl Render for ApprovalModal {
                         )
                     }),
             )
+            .when(!self.notes.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .p_3()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .children(self.notes.iter().map(|note| {
+                            h_flex()
+                                .gap_2()
+                                .items_start()
+                                .child(
+                                    Icon::new(IconName::Info)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(note.clone()).size(LabelSize::Small))
+                        })),
+                )
+            })
             .child(
                 div()
                     .p_2()
@@ -144,8 +171,13 @@ impl Render for ApprovalModal {
                     .border_color(cx.theme().colors().border_variant)
                     .child(
                         Button::new("reject", "Reject")
+                            .when(is_prod, |this| this.style(ButtonStyle::Filled))
                             .key_binding(ui::KeyBinding::for_action_in(
-                                &menu::Cancel,
+                                if is_prod {
+                                    &menu::Confirm
+                                } else {
+                                    &menu::Cancel
+                                },
                                 &self.focus_handle,
                                 cx,
                             ))
@@ -158,11 +190,13 @@ impl Render for ApprovalModal {
                             } else {
                                 ButtonStyle::Filled
                             })
-                            .key_binding(ui::KeyBinding::for_action_in(
-                                &menu::Confirm,
-                                &self.focus_handle,
-                                cx,
-                            ))
+                            .when(!is_prod, |this| {
+                                this.key_binding(ui::KeyBinding::for_action_in(
+                                    &menu::Confirm,
+                                    &self.focus_handle,
+                                    cx,
+                                ))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.respond(true, cx))),
                     ),
             )

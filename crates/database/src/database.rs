@@ -293,9 +293,40 @@ pub type Assignments = Vec<(String, Value)>;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Change {
-    Update { key: Assignments, set: Assignments },
-    Insert { values: Assignments },
-    Delete { key: Assignments },
+    Update {
+        key: Assignments,
+        set: Assignments,
+        /// The values the `set` fields had when the row was read. The update
+        /// only applies if they still hold, so it never silently overwrites
+        /// another session's write. Empty when there is nothing to check.
+        #[serde(default)]
+        expected: Assignments,
+    },
+    Insert {
+        values: Assignments,
+    },
+    Delete {
+        key: Assignments,
+    },
+}
+
+/// The expected values a statement can compare against. JSON is skipped:
+/// Postgres has no equality for `json`, and documents compare unreliably as
+/// text, so checking them would refuse good updates.
+pub(crate) fn checkable(expected: &[(String, Value)]) -> Vec<(String, Value)> {
+    expected
+        .iter()
+        .filter(|(_, value)| !matches!(value, Value::Json(_)))
+        .cloned()
+        .collect()
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Rehearsal {
+    pub notes: Vec<String>,
+    pub affected: u64,
+    /// Whether the transaction was left open.
+    pub held: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -342,6 +373,9 @@ pub struct ConnectionSpec {
     pub url: Option<String>,
     pub ssl_mode: Option<String>,
     pub read_only: bool,
+    /// Prod sessions get timeouts, so a stuck lock or an abandoned
+    /// transaction cannot hold up the database.
+    pub environment: DatabaseEnvironment,
 }
 
 impl ConnectionSpec {
@@ -413,6 +447,21 @@ pub(crate) trait Source: Send + Sync {
     /// The exact statements (or patch) `apply` would run, for approval.
     fn render_changes(&self, changes: &ChangeSet) -> Result<String>;
     async fn apply(&self, changes: &ChangeSet) -> Result<u64>;
+    /// What running `text` would do, as notes for a confirmation, found
+    /// without changing anything. Empty when the engine cannot tell.
+    async fn assess(&self, _text: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Runs `changes` in a transaction and describes what they did. Fails
+    /// where `apply` would fail. With `hold`, an engine with transactions
+    /// leaves it open for `settle`; otherwise it is rolled back.
+    async fn rehearse(&self, _changes: &ChangeSet, _hold: bool) -> Result<Rehearsal> {
+        Ok(Rehearsal::default())
+    }
+    /// Commits or rolls back the transaction a held rehearsal left open.
+    async fn settle(&self, _commit: bool) -> Result<()> {
+        anyhow::bail!("this database has no rehearsals to settle")
+    }
     async fn history(&self, _cursor: Option<String>) -> Result<HistoryBatch> {
         anyhow::bail!("this database does not expose a change history")
     }

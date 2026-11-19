@@ -663,6 +663,89 @@ impl DatabaseStore {
         })
     }
 
+    /// Notes on what running `text` would do, for a confirmation.
+    pub fn assess(
+        &mut self,
+        name: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<String>>> {
+        let request = self.request(
+            name,
+            Request::Assess {
+                connection: name.to_string(),
+                text,
+            },
+            cx,
+        );
+        cx.background_spawn(async move {
+            match request.await? {
+                Response::Notes(notes) => Ok(notes),
+                other => Err(anyhow!("unexpected response {other:?}")),
+            }
+        })
+    }
+
+    /// Runs `changes` in a transaction and describes what they did. With
+    /// `hold`, an engine with transactions keeps it open and returns a token
+    /// for `settle`; otherwise it is rolled back and the token is `None`.
+    pub fn rehearse(
+        &mut self,
+        name: &str,
+        changes: ChangeSet,
+        hold: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Vec<String>, Option<u64>)>> {
+        let request = self.request(
+            name,
+            Request::Rehearse {
+                connection: name.to_string(),
+                changes,
+                hold,
+            },
+            cx,
+        );
+        cx.background_spawn(async move {
+            match request.await? {
+                Response::Rehearsed { notes, token } => Ok((notes, token)),
+                other => Err(anyhow!("unexpected response {other:?}")),
+            }
+        })
+    }
+
+    /// Commits or rolls back a held rehearsal of changes to `collection`.
+    pub fn settle(
+        &mut self,
+        name: &str,
+        collection: CollectionRef,
+        token: u64,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<u64>> {
+        let request = self.request(
+            name,
+            Request::Settle {
+                connection: name.to_string(),
+                token,
+                commit,
+            },
+            cx,
+        );
+        let name: Arc<str> = name.into();
+        cx.spawn(async move |this, cx| {
+            let count = match request.await? {
+                Response::Applied(count) => count,
+                other => bail!("unexpected response {other:?}"),
+            };
+            if commit {
+                this.update(cx, |this, _| {
+                    this.schemas.remove(&(name, collection));
+                })?;
+            }
+            Ok(count)
+        })
+    }
+
     pub fn apply(
         &mut self,
         name: &str,
@@ -990,6 +1073,7 @@ fn entry_from_content(
             ssl_mode: content.ssl_mode.clone(),
             read_only: content.read_only.unwrap_or(false)
                 || kind == Some(DatabaseKind::ClickhouseRelay),
+            environment,
         },
         environment,
         agent_access: content.agent_access.unwrap_or(match environment {

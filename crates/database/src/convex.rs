@@ -221,6 +221,38 @@ impl ConvexSource {
         Ok((documents, next))
     }
 
+    /// Errors when the document a change targets is gone, or no longer has
+    /// the values the change was made against.
+    async fn check_current(&self, table: &str, change: &Change) -> Result<()> {
+        let (key, expected) = match change {
+            Change::Update { key, expected, .. } => (key, expected.as_slice()),
+            Change::Delete { key } => (key, &[][..]),
+            Change::Insert { .. } => return Ok(()),
+        };
+        let id = document_id(key)?;
+        let filter = Filter {
+            field: "_id".to_string(),
+            op: FilterOp::Eq,
+            value: Value::Text(id.clone()),
+        };
+        let (documents, _) = self.page(table, &[filter], None, 1).await?;
+        let Some(document) = documents.first() else {
+            bail!("Not saved: the document {id} no longer exists. Nothing was written.");
+        };
+        for (field, value) in expected {
+            let current = document
+                .get(field)
+                .map(decode_value)
+                .unwrap_or(Value::Missing);
+            if &current != value {
+                bail!(
+                    "Not saved: the document {id} changed after it was read; another session saved a new `{field}`. Nothing was written. Reload to see the current values."
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn calls(&self, changes: &ChangeSet) -> Result<Vec<(&'static str, Json)>> {
         let table = &changes.collection.name;
         changes
@@ -228,7 +260,7 @@ impl ConvexSource {
             .iter()
             .map(|change| {
                 Ok(match change {
-                    Change::Update { key, set } => {
+                    Change::Update { key, set, .. } => {
                         let id = document_id(key)?;
                         let fields = set
                             .iter()
@@ -400,6 +432,13 @@ impl Source for ConvexSource {
 
     async fn apply(&self, changes: &ChangeSet) -> Result<u64> {
         let calls = self.calls(changes)?;
+        // ponytail: the admin API's patch has no "only if unchanged", so the
+        // document is read just before writing. That narrows a stale edit's
+        // window to the gap between two requests; closing it would need a
+        // compare-and-set mutation deployed in the app.
+        for change in &changes.changes {
+            self.check_current(&changes.collection.name, change).await?;
+        }
         for (path, args) in &calls {
             self.call("mutation", path, args.clone()).await?;
         }
