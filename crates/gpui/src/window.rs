@@ -6015,6 +6015,36 @@ impl Window {
                 .active_drag_cursor_style()
                 .or_else(|| self.rendered_frame.cursor_style(self))
                 .unwrap_or(CursorStyle::Arrow);
+            // CUE-CURSOR-DEBUG (temporary)
+            if std::env::var_os("CUE_CURSOR_DEBUG").is_some() {
+                thread_local! {
+                    static LAST: std::cell::Cell<Option<CursorStyle>> = const { std::cell::Cell::new(None) };
+                }
+                if LAST.with(|last| last.replace(Some(style))) != Some(style) {
+                    let source = if let Some(drag) = cx.active_drag_cursor_style() {
+                        format!("active drag ({drag:?})")
+                    } else {
+                        let winner = self.rendered_frame.cursor_styles.iter().rev().find(|request| {
+                            request.hitbox_id.is_none_or(|id| id.is_hovered_ignoring_last_input(self))
+                        });
+                        match winner {
+                            None => "no request (default arrow)".to_string(),
+                            Some(request) => match request.hitbox_id {
+                                None => "window-level request".to_string(),
+                                Some(id) => format!(
+                                    "hitbox {:?}",
+                                    self.rendered_frame.hitboxes.iter().find(|h| h.id == id).map(|h| h.bounds)
+                                ),
+                            },
+                        }
+                    };
+                    eprintln!(
+                        "CUE-CURSOR {style:?} <- {source}; mouse {:?}; {} requests",
+                        self.mouse_position(),
+                        self.rendered_frame.cursor_styles.len()
+                    );
+                }
+            }
             cx.platform.set_cursor_style(style);
         }
     }
