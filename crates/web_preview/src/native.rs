@@ -11,7 +11,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass as _, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags, NSEventType, NSImage,
+    NSAutoresizingMaskOptions, NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags, NSEventType, NSImage,
     NSStandardKeyBindingResponding as _, NSView, NSWindow,
 };
 use objc2_foundation::{
@@ -66,6 +66,9 @@ impl MessageHandler {
 }
 
 pub(crate) struct NativeWebView {
+    /// What GPUI positions. Holds the page and, when docked, Web Inspector,
+    /// which WebKit lays out within the page's superview.
+    container: Retained<NSView>,
     view: Retained<WKWebView>,
     controller: Retained<WKUserContentController>,
     /// Bumped on every paint that positions the view; see [`PaintToken`].
@@ -136,14 +139,24 @@ impl NativeWebView {
                 &configuration,
             );
             view.setInspectable(true);
+            view.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            let container = NSView::initWithFrame(
+                NSView::alloc(mtm),
+                NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+            );
+            container.addSubview(&view);
+            container.setHidden(true);
             // Adds "Inspect Element" to the page's context menu. Private, but
             // WebKit has kept it stable for years; skipped if it ever goes.
             let preferences: Retained<NSObject> = msg_send![&*configuration, preferences];
             if preferences.respondsToSelector(sel!(_setDeveloperExtrasEnabled:)) {
                 let () = msg_send![&*preferences, _setDeveloperExtrasEnabled: true];
             }
-            view.setHidden(true);
             Ok(Self {
+                container,
                 view,
                 controller,
                 paint_generation: Cell::new(0),
@@ -175,15 +188,15 @@ impl NativeWebView {
         unsafe { self.view.goForward() };
     }
 
-    /// Opens Web Inspector in its own window, or closes it. WKWebView has no
-    /// public API for this; `_inspector` is what Safari's Develop menu uses.
-    /// Detached because docking it would resize the view GPUI positions.
+    /// Opens Web Inspector docked under the page, inside the preview, or
+    /// closes it. WKWebView has no public API for this; `_inspector` is what
+    /// Safari's Develop menu uses.
     pub(crate) fn toggle_inspector(&self) -> Result<()> {
         if !self.view.respondsToSelector(sel!(_inspector)) {
             bail!("this WebKit version does not expose Web Inspector");
         }
         // SAFETY: `_inspector` returns the view's `_WKInspector`, whose
-        // `isVisible`, `show`, `detach` and `close` take and return nothing
+        // `isVisible`, `show`, `attach` and `close` take and return nothing
         // unusual; called on the main thread.
         unsafe {
             let inspector: Option<Retained<AnyObject>> = msg_send![&*self.view, _inspector];
@@ -193,7 +206,7 @@ impl NativeWebView {
                 let () = msg_send![&*inspector, close];
             } else {
                 let () = msg_send![&*inspector, show];
-                let () = msg_send![&*inspector, detach];
+                let () = msg_send![&*inspector, attach];
             }
         }
         Ok(())
@@ -207,7 +220,7 @@ impl NativeWebView {
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        !self.view.isHidden() && self.view.window().is_some()
+        !self.container.isHidden() && self.container.window().is_some()
     }
 
     /// Places the view over `bounds` (GPUI window coordinates) and returns
@@ -221,19 +234,19 @@ impl NativeWebView {
         // SAFETY: Reading the superview of a live view on the main thread.
         let content_view =
             unsafe { gpui_view.superview() }.context("GPUI view has no superview")?;
-        let in_this_window = unsafe { self.view.superview() }
+        let in_this_window = unsafe { self.container.superview() }
             .is_some_and(|superview| std::ptr::eq(&*superview, &*content_view));
         if !in_this_window {
-            self.view.removeFromSuperview();
-            content_view.addSubview(&self.view);
+            self.container.removeFromSuperview();
+            content_view.addSubview(&self.container);
         }
         let container = content_view.bounds();
         let frame = appkit_frame(bounds, container.size.height, content_view.isFlipped());
-        self.view.setFrame(NSRect::new(
+        self.container.setFrame(NSRect::new(
             NSPoint::new(frame.x, frame.y),
             NSSize::new(frame.width, frame.height),
         ));
-        self.view.setHidden(false);
+        self.container.setHidden(false);
         let generation = self.paint_generation.get() + 1;
         self.paint_generation.set(generation);
         Ok(PaintToken {
@@ -243,11 +256,11 @@ impl NativeWebView {
     }
 
     pub(crate) fn hide(&self) {
-        if self.view.isHidden() {
+        if self.container.isHidden() {
             return;
         }
         self.release_keyboard();
-        self.view.setHidden(true);
+        self.container.setHidden(true);
         // A later paint must not mistake an older token for the current one.
         self.paint_generation.set(self.paint_generation.get() + 1);
     }
@@ -259,13 +272,13 @@ impl NativeWebView {
         window.firstResponder().is_some_and(|responder| {
             responder
                 .downcast::<NSView>()
-                .is_ok_and(|view| view.isDescendantOf(&self.view))
+                .is_ok_and(|view| view.isDescendantOf(&self.container))
         })
     }
 
     pub(crate) fn take_keyboard(&self) {
         if let Some(window) = self.view.window()
-            && !self.view.isHidden()
+            && !self.container.isHidden()
             && !self.has_keyboard()
         {
             window.makeFirstResponder(Some(&self.view));
@@ -283,11 +296,11 @@ impl NativeWebView {
             return;
         };
         // SAFETY: Reading the superview of a live view on the main thread.
-        let gpui_view = unsafe { self.view.superview() }.and_then(|content_view| {
+        let gpui_view = unsafe { self.container.superview() }.and_then(|content_view| {
             content_view
                 .subviews()
                 .iter()
-                .find(|view| !view.isDescendantOf(&self.view) && is_gpui_view(view))
+                .find(|view| !view.isDescendantOf(&self.container) && is_gpui_view(view))
         });
         window.makeFirstResponder(gpui_view.as_deref().map(|view| view.as_ref()));
     }
@@ -424,7 +437,7 @@ impl NativeWebView {
 
 impl NativeWebView {
     fn on_screen_window(&self) -> Result<Retained<NSWindow>> {
-        if self.view.isHidden() {
+        if self.container.isHidden() {
             bail!("the preview is not on screen (another tab or a modal is in front of it)");
         }
         self.view.window().context("the preview is not in a window")
@@ -479,7 +492,7 @@ impl Drop for NativeWebView {
             self.controller
                 .removeScriptMessageHandlerForName(&NSString::from_str(MESSAGE_HANDLER_NAME));
         }
-        self.view.removeFromSuperview();
+        self.container.removeFromSuperview();
     }
 }
 
