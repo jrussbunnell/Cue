@@ -375,14 +375,16 @@ impl McpServerTool for Evaluate {
     const NAME: &'static str = "browser_evaluate";
 
     fn annotations(&self) -> ToolAnnotations {
-        annotations("Run JavaScript in the preview", false)
+        // It can do anything the signed-in page can, so clients that ask
+        // before destructive tools should ask here.
+        ToolAnnotations {
+            destructive_hint: Some(true),
+            ..annotations("Run JavaScript in the preview", false)
+        }
     }
 
     async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
-        let (preview, _, _) = self
-            .0
-            .find_preview(cx)
-            .context("no web preview is open; call browser_navigate first")?;
+        let preview = self.0.visible_preview(cx).await?;
         let body = evaluate_body(&input.script);
         let result = preview
             .read_with(cx, |preview, _| preview.native().evaluate(&body))
