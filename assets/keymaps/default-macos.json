@@ -712,8 +712,6 @@
       // Change the default action on `menu::Confirm` by setting the parameter
       // "alt-cmd-o": ["projects::OpenRecent", {"create_new_window": true }],
       "alt-cmd-o": "projects::OpenRecent",
-      "alt-cmd-u": "web_preview::OpenTerminalLink",
-      "alt-cmd-b": "web_preview::OpenInBrowser",
       "ctrl-r": "projects::OpenRecent",
       "ctrl-cmd-o": ["projects::OpenRemote", { "from_existing_connection": false }],
       "ctrl-cmd-shift-o": ["projects::OpenRemote", { "from_existing_connection": true }],
@@ -736,6 +734,7 @@
       "cmd-8": ["workspace::ActivatePane", 7],
       "cmd-9": ["workspace::ActivatePane", 8],
       "cmd-b": "workspace::ToggleLeftDock",
+      "cmd-alt-b": "workspace::ToggleRightDock",
       "cmd-r": "workspace::ToggleRightDock",
       "cmd-j": "workspace::ToggleBottomDock",
       "cmd-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
@@ -989,9 +988,16 @@
     },
   },
   {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-shift-u": "web_preview::OpenTerminalLink",
+    },
+  },
+  {
     "context": "WebPreview",
     "bindings": {
-      "alt-cmd-i": "web_preview::ToggleInspector",
+      "cmd-shift-i": "web_preview::ToggleInspector",
+      "cmd-shift-b": "web_preview::OpenInBrowser",
     },
   },
   // Custom bindings
