@@ -207,10 +207,9 @@ impl AgentPanel {
             return;
         }
 
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let http_client = workspace.read(cx).client().http_client();
+        // Not `self.workspace.read(cx)`: this runs while the panel is being
+        // constructed inside a workspace update, so reading it would panic.
+        let http_client = client::Client::global(cx).http_client();
         let window = window.window_handle();
         // Pulled here, on the main thread, because the wake listener runs on a
         // thread with no context to reach the global from — and it has to be
