@@ -47,6 +47,7 @@ use crate::conversation_view::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use crate::message_editor::SessionCapabilities;
+use crate::side_questions::{self, SideQuestion, SideQuestionId, SideQuestionState};
 use crate::subagent_notifications;
 use crate::subagents::{SubagentActivity, SubagentSummary};
 use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
@@ -417,6 +418,16 @@ impl Conversation {
 
     pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>) {
         self.workspace = Some(workspace);
+    }
+
+    /// Forgets a thread that is going away, such as a dismissed side question.
+    /// Its event subscription stays until the conversation is dropped, but has
+    /// nothing left to update.
+    fn unregister_thread(&mut self, session_id: &acp_v2::SessionId, cx: &mut Context<Self>) {
+        self.threads.remove(session_id);
+        self.permission_requests.shift_remove(session_id);
+        self.elicitation_requests.shift_remove(session_id);
+        cx.notify();
     }
 
     /// What has been observed about a subagent beyond its spawning tool call.
@@ -1240,6 +1251,10 @@ pub struct ConversationView {
     /// directly, and again through the `SubagentSpawned` it emits — and without
     /// this both would build a thread for the same subagent.
     loading_subagents: HashSet<acp_v2::SessionId>,
+    /// Questions asked with `/btw`, each answered by a fork of the session it
+    /// was asked in, in the order they were asked.
+    side_questions: Vec<SideQuestion>,
+    next_side_question_id: usize,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
     /// causes mermaid diagrams to re-render).
@@ -1671,6 +1686,8 @@ impl ConversationView {
             notification_subscriptions: HashMap::default(),
             auth_task: None,
             loading_subagents: HashSet::default(),
+            side_questions: Vec::new(),
+            next_side_question_id: 0,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
@@ -2092,11 +2109,15 @@ impl ConversationView {
             .downcast::<agent::NativeAgentConnection>()
             .map(|native_connection| native_available_skills(&native_connection, &session_id, cx))
             .unwrap_or_default();
-        let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
+        let mut session_capabilities = SessionCapabilities::new(
             thread.read(cx).prompt_capabilities().clone(),
             thread.read(cx).available_commands().to_vec(),
             available_skills,
-        )));
+        );
+        session_capabilities.set_offers_side_questions(
+            connection.supports_fork_session() && thread.read(cx).parent_session_id().is_none(),
+        );
+        let session_capabilities = Arc::new(RwLock::new(session_capabilities));
 
         let action_log = thread.read(cx).action_log().clone();
 
@@ -3323,6 +3344,246 @@ impl ConversationView {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    pub(crate) fn side_questions_for<'a>(
+        &'a self,
+        parent_session_id: &'a acp_v2::SessionId,
+    ) -> impl Iterator<Item = &'a SideQuestion> + 'a {
+        self.side_questions
+            .iter()
+            .filter(move |question| &question.parent_session_id == parent_session_id)
+    }
+
+    /// Forks `parent_session_id` and asks the fork `question`, leaving the
+    /// parent's turn alone. The fork keeps the parent's mode and can act on
+    /// what it is asked, not only answer.
+    pub(crate) fn ask_side_question(
+        &mut self,
+        parent_session_id: acp_v2::SessionId,
+        question: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        let Some(parent_thread) = connected
+            .threads
+            .get(&parent_session_id)
+            .map(|view| view.read(cx).thread.clone())
+        else {
+            return;
+        };
+        let connection = connected.connection.clone();
+        let work_dirs = parent_thread
+            .read(cx)
+            .work_dirs()
+            .cloned()
+            .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
+        let fork = connection.clone().fork_session(
+            parent_session_id.clone(),
+            self.project.clone(),
+            work_dirs,
+            Some(side_questions::system_prompt()),
+            cx,
+        );
+
+        let id = SideQuestionId(self.next_side_question_id);
+        self.next_side_question_id += 1;
+        let task = cx.spawn_in(window, {
+            let question = question.clone();
+            async move |this, cx| {
+                let thread = match fork.await {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        log::error!("btw: could not fork the session: {error:#}");
+                        this.update(cx, |this, cx| {
+                            this.set_side_question_state(
+                                id,
+                                SideQuestionState::Failed(
+                                    format!("Couldn't fork the session: {error}").into(),
+                                ),
+                                cx,
+                            );
+                        })
+                        .log_err();
+                        return;
+                    }
+                };
+                let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+                let attached = this
+                    .update_in(cx, |this, window, cx| {
+                        this.attach_side_question_thread(id, thread.clone(), window, cx)
+                    })
+                    .unwrap_or(false);
+                if !attached {
+                    // Dismissed while it was forking.
+                    if connection.supports_close_session()
+                        && let Ok(close) =
+                            cx.update(|_, cx| connection.clone().close_session(&session_id, cx))
+                    {
+                        close.await.log_err();
+                    }
+                    return;
+                }
+
+                let submission = thread.update(cx, |thread, cx| {
+                    thread
+                        .set_title(side_questions::title(&question), cx)
+                        .detach_and_log_err(cx);
+                    thread.send(
+                        vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                            question,
+                        ))],
+                        cx,
+                    )
+                });
+                if let Err(error) = submission.await {
+                    log::error!("btw: the side question failed: {error:#}");
+                    this.update(cx, |this, cx| {
+                        this.set_side_question_state(
+                            id,
+                            SideQuestionState::Failed(error.to_string().into()),
+                            cx,
+                        );
+                    })
+                    .log_err();
+                }
+            }
+        });
+
+        self.side_questions.push(SideQuestion {
+            id,
+            parent_session_id: parent_session_id.clone(),
+            question: question.into(),
+            state: SideQuestionState::Forking,
+            thread: None,
+            _subscription: None,
+            _task: task,
+        });
+        self.notify_side_question_parent(&parent_session_id, cx);
+    }
+
+    /// Returns false when the side question was dismissed while it forked.
+    fn attach_side_question_thread(
+        &mut self,
+        id: SideQuestionId,
+        thread: Entity<AcpThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(question) = self
+            .side_questions
+            .iter_mut()
+            .find(|question| question.id == id)
+        else {
+            return false;
+        };
+        let parent_session_id = question.parent_session_id.clone();
+        question.thread = Some(thread.clone());
+        question.state = SideQuestionState::Ready;
+        // The parent's strip previews the answer as it streams in.
+        question._subscription = Some(cx.subscribe(&thread, {
+            let parent_session_id = parent_session_id.clone();
+            move |this, _thread, _event: &AcpThreadEvent, cx| {
+                this.notify_side_question_parent(&parent_session_id, cx);
+            }
+        }));
+
+        let session_id = thread.read(cx).session_id().clone();
+        self.add_subagent_thread_view(thread, window, cx);
+        if let Some(view) = self.thread_view(&session_id) {
+            view.update(cx, |view, cx| {
+                view.is_side_question = true;
+                cx.notify();
+            });
+        }
+        self.notify_side_question_parent(&parent_session_id, cx);
+        true
+    }
+
+    fn set_side_question_state(
+        &mut self,
+        id: SideQuestionId,
+        state: SideQuestionState,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(question) = self
+            .side_questions
+            .iter_mut()
+            .find(|question| question.id == id)
+        else {
+            return;
+        };
+        question.state = state;
+        let parent_session_id = question.parent_session_id.clone();
+        self.notify_side_question_parent(&parent_session_id, cx);
+    }
+
+    /// Stops the fork if it is still answering, closes its session, and
+    /// forgets it.
+    ///
+    /// Called from the parent's thread view, which is leased at the time, so
+    /// that view is notified by id rather than updated.
+    pub(crate) fn dismiss_side_question(
+        &mut self,
+        id: SideQuestionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .side_questions
+            .iter()
+            .position(|question| question.id == id)
+        else {
+            return;
+        };
+        let question = self.side_questions.remove(index);
+        self.notify_side_question_parent(&question.parent_session_id, cx);
+        let Some(thread) = question.thread else {
+            return;
+        };
+        let session_id = thread.read(cx).session_id().clone();
+        if thread.read(cx).status() == acp_thread::ThreadStatus::Generating {
+            thread
+                .update(cx, |thread, cx| thread.cancel(cx))
+                .detach_and_log_err(cx);
+        }
+
+        let is_active = self
+            .as_connected()
+            .is_some_and(|connected| connected.active_id.as_ref() == Some(&session_id));
+        if is_active {
+            self.navigate_to_thread(question.parent_session_id.clone(), window, cx);
+        }
+        let Some(connected) = self.as_connected_mut() else {
+            return;
+        };
+        connected.threads.remove(&session_id);
+        let connection = connected.connection.clone();
+        connected.conversation.update(cx, |conversation, cx| {
+            conversation.unregister_thread(&session_id, cx);
+        });
+        if connection.supports_close_session() {
+            connection
+                .close_session(&session_id, cx)
+                .detach_and_log_err(cx);
+        }
+        cx.notify();
+    }
+
+    fn notify_side_question_parent(
+        &self,
+        parent_session_id: &acp_v2::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.thread_view(parent_session_id) {
+            let app: &mut App = cx;
+            app.notify(view.entity_id());
+        }
+        cx.notify();
     }
 
     fn spawn_external_agent_login(
@@ -7661,6 +7922,141 @@ pub(crate) mod tests {
                 assert_eq!(&thread_view.read(cx).thread, thread);
             }
         });
+    }
+
+    fn user_messages(thread: &Entity<AcpThread>, cx: &App) -> Vec<String> {
+        thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .map(|entry| entry.to_markdown(cx))
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_btw_forks_without_interrupting_the_running_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new()
+            .with_supports_fork_session(true)
+            .with_supports_close_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Do the work", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        cx.update(|_, cx| {
+            connection.send_update(
+                root_session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Working".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), ThreadStatus::Generating)
+        });
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("/btw why this approach?", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        root.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), ThreadStatus::Generating)
+        });
+        assert_eq!(cx.read(|cx| user_messages(&root, cx)).len(), 1);
+        assert!(message_editor.read_with(cx, |editor, cx| editor.is_empty(cx)));
+        let fork_calls = connection.fork_session_calls();
+        assert_eq!(fork_calls.len(), 1);
+        assert_eq!(fork_calls[0].0, root_session_id);
+        assert!(fork_calls[0].1.is_some());
+
+        let (id, fork) = conversation_view.read_with(cx, |view, cx| {
+            let questions = view
+                .side_questions_for(&root_session_id)
+                .collect::<Vec<_>>();
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].state, SideQuestionState::Ready);
+            let fork = questions[0].thread.clone().expect("forked");
+            let fork_session_id = fork.read(cx).session_id().clone();
+            let fork_view = view.thread_view(&fork_session_id).expect("fork has a view");
+            assert!(fork_view.read(cx).is_side_question);
+            assert_eq!(fork.read(cx).parent_session_id(), Some(&root_session_id));
+            (questions[0].id, fork)
+        });
+        let fork_messages = cx.read(|cx| user_messages(&fork, cx));
+        assert_eq!(fork_messages.len(), 1);
+        assert!(fork_messages[0].contains("why this approach?"));
+
+        let fork_session_id = fork.read_with(cx, |thread, _| thread.session_id().clone());
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.dismiss_side_question(id, window, cx);
+        });
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, _| {
+            assert_eq!(view.side_questions_for(&root_session_id).count(), 0);
+            assert!(view.thread_view(&fork_session_id).is_none());
+        });
+        assert_eq!(connection.take_close_session_calls(), vec![fork_session_id]);
+        root.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), ThreadStatus::Generating)
+        });
+    }
+
+    #[gpui::test]
+    async fn test_bare_btw_asks_for_a_question(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_fork_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("/btw", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        assert!(connection.fork_session_calls().is_empty());
+        assert!(
+            active_thread(&conversation_view, cx)
+                .read_with(cx, |view, _| view.thread_error.is_some())
+        );
+        assert!(!message_editor.read_with(cx, |editor, cx| editor.is_empty(cx)));
+    }
+
+    #[gpui::test]
+    async fn test_btw_is_offered_only_when_the_agent_can_fork(cx: &mut TestAppContext) {
+        init_test(cx);
+        for supports_fork in [false, true] {
+            let connection = StubAgentConnection::new().with_supports_fork_session(supports_fork);
+            let (conversation_view, cx) =
+                setup_conversation_view(StubAgentServer::new(connection), cx).await;
+            let offered = active_thread(&conversation_view, cx).read_with(cx, |view, _| {
+                view.session_capabilities
+                    .read()
+                    .completion_commands()
+                    .iter()
+                    .any(|command| command.name.as_ref() == side_questions::BTW_COMMAND)
+            });
+            assert_eq!(offered, supports_fork);
+        }
     }
 
     #[gpui::test]

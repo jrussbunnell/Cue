@@ -1764,6 +1764,124 @@ impl AgentConnection for AcpConnection {
         )
     }
 
+    fn supports_fork_session(&self) -> bool {
+        self.agent_capabilities.session_capabilities.fork.is_some()
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        source_session_id: acp_v2::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        system_prompt: Option<String>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        if !self.supports_fork_session() {
+            return Task::ready(Err(anyhow!(LoadError::Other(
+                "Forking sessions is not supported by this agent.".into()
+            ))));
+        }
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let supports_close = self.agent_supports_session_close();
+
+        cx.spawn(async move |cx| {
+            let (response_sender, response_received) = futures::channel::oneshot::channel();
+            let (registered, registration_finished) = futures::channel::oneshot::channel();
+            let mut request = acp::ForkSessionRequest::new(
+                acp::SessionId::new(source_session_id.0.clone()),
+                directories.cwd,
+            )
+            .additional_directories(directories.additional_directories)
+            .mcp_servers(mcp_servers);
+            if let Some(system_prompt) = system_prompt {
+                request = request.system_prompt(
+                    acp::SystemPrompt::new(vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        system_prompt,
+                    ))])
+                    .mode(acp::SystemPromptMode::Append),
+                );
+            }
+            let request = self.connection.prepare_request(request);
+            let cancellation = request.cancellation_handle();
+            request
+                .on_receiving_result({
+                    let connection = self.connection.clone();
+                    // Like `new_session`, the fork's updates are held until it is
+                    // registered, so nothing it sends early reaches no thread.
+                    async move |result: Result<
+                        acp::ForkSessionResponse,
+                        agent_client_protocol::Error,
+                    >| {
+                        let session_id = result
+                            .as_ref()
+                            .ok()
+                            .map(|response| response.session_id.clone());
+                        let registered = response_sender.send(result).is_ok()
+                            && registration_finished.await.is_ok();
+                        if !registered
+                            && supports_close
+                            && let Some(session_id) = session_id
+                        {
+                            connection
+                                .prepare_request(acp::CloseSessionRequest::new(session_id))
+                                .on_receiving_result(
+                                    async move |result: Result<
+                                        acp::CloseSessionResponse,
+                                        agent_client_protocol::Error,
+                                    >| {
+                                        if let Err(error) = result {
+                                            log::warn!(
+                                                "ACP abandoned-fork close failed with code {}",
+                                                error.code
+                                            );
+                                        }
+                                        Ok(())
+                                    },
+                                )
+                                .log_err();
+                        }
+                        Ok(())
+                    }
+                })
+                .map_err(map_acp_error)?;
+            let _request_guard = util::defer(move || {
+                cancellation.cancel().log_err();
+            });
+            let response = response_received
+                .await
+                .context("ACP fork-session response callback was cancelled")?
+                .map_err(map_acp_error)?;
+
+            let (modes, config_options) = config_state(response.modes, response.config_options)?;
+            let session_id = acp_v2::SessionId::new(response.session_id.0);
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            let thread: Entity<AcpThread> = cx.new(|cx| {
+                AcpThread::new(
+                    Some(source_session_id),
+                    None,
+                    Some(work_dirs),
+                    self.clone(),
+                    project,
+                    action_log,
+                    session_id.clone(),
+                    watch::Receiver::constant(self.prompt_capabilities()),
+                    cx,
+                )
+            });
+            cx.update(|cx| {
+                self.register_session(session_id, &thread, modes, config_options, None, cx)
+            });
+            registered.send(()).map_err(|_| {
+                anyhow!("ACP fork-session ordering callback ended before registration")
+            })?;
+            Ok(thread)
+        })
+    }
+
     fn local_session_thread(
         &self,
         session_id: &acp_v2::SessionId,

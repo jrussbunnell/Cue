@@ -216,6 +216,27 @@ pub trait AgentConnection {
         )))
     }
 
+    /// Whether this agent can copy a session's transcript into a new session.
+    fn supports_fork_session(&self) -> bool {
+        false
+    }
+
+    /// Starts a new session holding a copy of `source_session_id`'s transcript.
+    /// The source session is left untouched and keeps running. The fork's
+    /// thread names the source as its parent, so it is shown as its child.
+    ///
+    /// `system_prompt` is appended to the fork's system prompt.
+    fn fork_session(
+        self: Rc<Self>,
+        _source_session_id: acp_v2::SessionId,
+        _project: Entity<Project>,
+        _work_dirs: PathList,
+        _system_prompt: Option<String>,
+        _cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Err(anyhow::Error::msg("Forking sessions is not supported")))
+    }
+
     /// Whether this agent supports showing session history.
     fn supports_session_history(&self) -> bool {
         self.supports_load_session() || self.supports_resume_session()
@@ -1104,6 +1125,9 @@ mod test_support {
         local_threads: Arc<Mutex<HashMap<acp_v2::SessionId, Entity<AcpThread>>>>,
         supports_load_session: bool,
         supports_close_session: bool,
+        supports_fork_session: bool,
+        /// Each fork's source session and appended system prompt.
+        fork_session_calls: Arc<Mutex<Vec<(acp_v2::SessionId, Option<String>)>>>,
         announces_subagents: bool,
         close_sessions_on_release: bool,
         supports_session_additional_directories: bool,
@@ -1160,6 +1184,8 @@ mod test_support {
                 supports_retry: false,
                 supports_load_session: false,
                 supports_close_session: false,
+                supports_fork_session: false,
+                fork_session_calls: Arc::default(),
                 announces_subagents: false,
                 close_sessions_on_release: true,
                 supports_session_additional_directories: false,
@@ -1319,6 +1345,15 @@ mod test_support {
         pub fn with_supports_close_session(mut self, supports_close_session: bool) -> Self {
             self.supports_close_session = supports_close_session;
             self
+        }
+
+        pub fn with_supports_fork_session(mut self, supports_fork_session: bool) -> Self {
+            self.supports_fork_session = supports_fork_session;
+            self
+        }
+
+        pub fn fork_session_calls(&self) -> Vec<(acp_v2::SessionId, Option<String>)> {
+            self.fork_session_calls.lock().clone()
         }
 
         pub fn with_announced_subagents(mut self, announces_subagents: bool) -> Self {
@@ -1505,6 +1540,49 @@ mod test_support {
 
         fn supports_close_session(&self) -> bool {
             self.supports_close_session
+        }
+
+        fn supports_fork_session(&self) -> bool {
+            self.supports_fork_session
+        }
+
+        fn fork_session(
+            self: Rc<Self>,
+            source_session_id: acp_v2::SessionId,
+            project: Entity<Project>,
+            work_dirs: PathList,
+            system_prompt: Option<String>,
+            cx: &mut gpui::App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            if !self.supports_fork_session {
+                return Task::ready(Err(anyhow::anyhow!("Forking sessions is not supported")));
+            }
+            self.fork_session_calls
+                .lock()
+                .push((source_session_id.clone(), system_prompt));
+            let session_id = acp_v2::SessionId::new(StubSessionCounter::next(cx).to_string());
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            let thread = cx.new(|cx| {
+                AcpThread::new(
+                    Some(source_session_id),
+                    None,
+                    Some(work_dirs),
+                    self.clone(),
+                    project,
+                    action_log,
+                    session_id.clone(),
+                    self.prompt_capabilities_rx.clone(),
+                    cx,
+                )
+            });
+            self.sessions.lock().insert(
+                session_id,
+                Session {
+                    thread: thread.downgrade(),
+                    response_tx: None,
+                },
+            );
+            Task::ready(Ok(thread))
         }
 
         fn announces_subagents(&self) -> bool {

@@ -51,6 +51,8 @@ pub struct SessionCapabilities {
     prompt_capabilities: acp_v2::PromptCapabilities,
     available_commands: Vec<acp_v2::AvailableCommand>,
     available_skills: Vec<AvailableSkill>,
+    /// Whether to offer Cue's own `/btw`, which the agent never sees.
+    offers_side_questions: bool,
 }
 
 impl SessionCapabilities {
@@ -63,7 +65,12 @@ impl SessionCapabilities {
             prompt_capabilities,
             available_commands: slash_commands(available_commands),
             available_skills,
+            offers_side_questions: false,
         }
+    }
+
+    pub fn set_offers_side_questions(&mut self, offers_side_questions: bool) {
+        self.offers_side_questions = offers_side_questions;
     }
 
     pub fn from_acp_commands(
@@ -94,7 +101,9 @@ impl SessionCapabilities {
     }
 
     pub fn has_slash_completions(&self) -> bool {
-        !self.available_commands.is_empty() || !self.available_skills.is_empty()
+        !self.available_commands.is_empty()
+            || !self.available_skills.is_empty()
+            || self.offers_side_questions
     }
 
     fn supported_modes(&self, has_thread_store: bool) -> Vec<PromptContextType> {
@@ -126,6 +135,13 @@ impl SessionCapabilities {
                 source: None,
                 category: acp_thread::command_category_from_meta(command.meta()),
             })
+            .chain(self.offers_side_questions.then(|| AvailableCommand {
+                name: crate::side_questions::BTW_COMMAND.into(),
+                description: crate::side_questions::BTW_COMMAND_DESCRIPTION.into(),
+                requires_argument: true,
+                source: None,
+                category: None,
+            }))
             .collect()
     }
 

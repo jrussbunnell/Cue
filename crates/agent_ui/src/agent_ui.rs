@@ -24,6 +24,7 @@ mod model_selector;
 mod model_selector_popover;
 pub mod narration_peek;
 mod profile_selector;
+mod side_questions;
 mod sidecar;
 mod subagent_notifications;
 pub mod subagents;

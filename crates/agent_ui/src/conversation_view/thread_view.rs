@@ -29,6 +29,7 @@ use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 use crate::agent_panel_styling::AgentPanelStylingSettings;
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::message_editor::SharedSessionCapabilities;
+use crate::side_questions::{self, SideQuestionId, SideQuestionState};
 use crate::subagents::{SubagentActivity, SubagentCounts, SubagentStatus, SubagentSummary};
 use crate::ui::{
     SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip, TerminalSandboxWarning,
@@ -742,6 +743,10 @@ pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp_v2::SessionId,
     pub parent_session_id: Option<acp_v2::SessionId>,
+    /// A fork answering a `/btw` question. It is its parent's child, but
+    /// unlike a subagent it is a session of its own that takes messages
+    /// directly.
+    pub(crate) is_side_question: bool,
     pub thread: Entity<AcpThread>,
     pub(crate) conversation: Entity<super::Conversation>,
     pub server_view: WeakEntity<ConversationView>,
@@ -1655,6 +1660,7 @@ impl ThreadView {
             root_thread_id,
             session_id,
             parent_session_id,
+            is_side_question: false,
             focus_handle: cx.focus_handle(),
             thread,
             conversation,
@@ -3961,6 +3967,253 @@ impl ThreadView {
         self.submission_reveal_tasks.insert(submission_id, task);
     }
 
+    /// Asks the thread's connection rather than the conversation: `send` runs
+    /// inside conversation updates (voice mode starts sessions that way), where
+    /// reading the conversation would panic.
+    fn can_ask_side_question(&self, cx: &App) -> bool {
+        (self.parent_session_id.is_none() || self.is_side_question)
+            && self.thread.read(cx).connection().supports_fork_session()
+    }
+
+    fn ask_side_question(&mut self, question: String, window: &mut Window, cx: &mut Context<Self>) {
+        let session_id = self.session_id.clone();
+        let server_view = self.server_view.clone();
+        // The conversation reads this view to find the session's thread, and
+        // this view is leased while it handles the event that got us here.
+        window.defer(cx, move |window, cx| {
+            server_view
+                .update(cx, |server_view, cx| {
+                    server_view.ask_side_question(session_id, question, window, cx);
+                })
+                .log_err();
+        });
+    }
+
+    fn draft_side_question_about(
+        &mut self,
+        selection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.message_editor.read(cx).is_empty(cx) {
+            self.handle_thread_error(
+                anyhow!("Send or clear your draft first, then choose Ask About This again."),
+                cx,
+            );
+            return;
+        }
+        let (draft, cursor) = side_questions::ask_about_selection_draft(selection);
+        self.message_editor.update(cx, |message_editor, cx| {
+            message_editor.editor().update(cx, |editor, cx| {
+                editor.set_text(draft, window, cx);
+            });
+            message_editor.set_cursor_offset(cursor, window, cx);
+        });
+        self.message_editor.focus_handle(cx).focus(window, cx);
+    }
+
+    fn use_side_question_answer(
+        &mut self,
+        question: &str,
+        answer: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = side_questions::answer_for_parent(question, answer);
+        self.message_editor.update(cx, |message_editor, cx| {
+            if message_editor.is_empty(cx) {
+                message_editor.insert_text(&text, window, cx);
+            } else {
+                message_editor.insert_text(&format!("\n\n{text}"), window, cx);
+            }
+        });
+        self.message_editor.focus_handle(cx).focus(window, cx);
+    }
+
+    fn render_side_questions(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        struct Row {
+            id: SideQuestionId,
+            question: SharedString,
+            status: SharedString,
+            status_color: Color,
+            detail: Option<SharedString>,
+            session_id: Option<acp_v2::SessionId>,
+            answer: Option<String>,
+        }
+
+        let server_view = self.server_view.upgrade()?;
+        let rows = server_view
+            .read(cx)
+            .side_questions_for(&self.session_id)
+            .map(|question| {
+                let answer = question.answer(cx);
+                let (status, status_color, detail): (SharedString, Color, Option<SharedString>) =
+                    match &question.state {
+                        SideQuestionState::Forking => ("Forking…".into(), Color::Muted, None),
+                        SideQuestionState::Failed(error) => {
+                            ("Failed".into(), Color::Error, Some(error.clone()))
+                        }
+                        SideQuestionState::Ready if question.is_generating(cx) => {
+                            ("Answering…".into(), Color::Accent, None)
+                        }
+                        SideQuestionState::Ready if answer.is_some() => {
+                            ("Answered".into(), Color::Success, None)
+                        }
+                        SideQuestionState::Ready => ("No answer".into(), Color::Muted, None),
+                    };
+                Row {
+                    id: question.id,
+                    question: question.question.clone(),
+                    status,
+                    status_color,
+                    detail,
+                    session_id: question.session_id(cx),
+                    answer,
+                }
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return None;
+        }
+
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let rows = rows.into_iter().map(|row| {
+            let row_id = row.id.0;
+            let preview: SharedString = row
+                .detail
+                .clone()
+                .or_else(|| {
+                    row.answer.as_deref().map(|answer| {
+                        let flattened = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+                        util::truncate_and_trailoff(&flattened, 200).into()
+                    })
+                })
+                .unwrap_or_default();
+            let question_line: SharedString = side_questions::title(&row.question)
+                .trim_start_matches("btw: ")
+                .to_string()
+                .into();
+
+            h_flex()
+                .id(("side-question", row_id))
+                .w_full()
+                .px_3()
+                .py_1()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::Chat)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            Label::new(question_line)
+                                .size(LabelSize::Small)
+                                .single_line()
+                                .truncate(),
+                        )
+                        .when(!preview.is_empty(), |this| {
+                            this.child(
+                                Label::new(preview)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line()
+                                    .truncate(),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .id(("side-question-status", row_id))
+                        .flex_none()
+                        .child(
+                            Label::new(row.status)
+                                .size(LabelSize::Small)
+                                .color(row.status_color),
+                        )
+                        .when_some(row.detail, |this, detail| {
+                            this.tooltip(Tooltip::text(detail))
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .when_some(row.session_id, |this, session_id| {
+                            this.child(
+                                Button::new(("open-side-question", row_id), "Open")
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::text(
+                                        "Open the fork to read the whole answer or follow up",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if let Some(server_view) = this.server_view.upgrade() {
+                                            server_view.update(cx, |server_view, cx| {
+                                                server_view.navigate_to_thread(
+                                                    session_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    })),
+                            )
+                        })
+                        .when_some(row.answer, |this, answer| {
+                            let question = row.question.clone();
+                            this.child(
+                                Button::new(("use-side-question-answer", row_id), "Use Answer")
+                                    .label_size(LabelSize::Small)
+                                    .tooltip(Tooltip::text(
+                                        "Add the answer to your message to this session",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.use_side_question_answer(
+                                            &question, &answer, window, cx,
+                                        );
+                                    })),
+                            )
+                        })
+                        .child(
+                            IconButton::new(("dismiss-side-question", row_id), IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Dismiss and close the fork"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let server_view = this.server_view.clone();
+                                    let id = row.id;
+                                    window.defer(cx, move |window, cx| {
+                                        server_view
+                                            .update(cx, |server_view, cx| {
+                                                server_view.dismiss_side_question(id, window, cx);
+                                            })
+                                            .log_err();
+                                    });
+                                })),
+                        ),
+                )
+        });
+
+        Some(
+            v_flex()
+                .w_full()
+                .py_1()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    v_flex()
+                        .w_full()
+                        .when_some(max_content_width, |this, max_width| {
+                            this.max_w(max_width).mx_auto()
+                        })
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_recoverable_submissions(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let submissions = {
             let thread = self.thread.read(cx);
@@ -4216,11 +4469,31 @@ impl ThreadView {
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Checked before anything that would queue the message behind the
+        // running turn: the point of a side question is not to wait for it.
+        if self.can_ask_side_question(cx) {
+            let text = self.message_editor.read(cx).text(cx);
+            if let Some(question) = side_questions::parse_btw_command(&text) {
+                if question.is_empty() {
+                    self.handle_thread_error(
+                        anyhow!("Type a question after /btw to ask it in a fork of this session."),
+                        cx,
+                    );
+                    return;
+                }
+                let question = question.to_string();
+                self.message_editor
+                    .update(cx, |editor, cx| editor.clear(window, cx));
+                cx.emit(AcpThreadViewEvent::Interacted);
+                self.ask_side_question(question, window, cx);
+                return;
+            }
+        }
         // A derived subagent has no session on the agent side, so prompting it
         // directly would name a session the agent has never heard of. Claude
         // Code's agent teams address a member by name instead, which only the
         // parent can do.
-        if self.is_subagent() && self.send_to_subagent(window, cx) {
+        if self.is_subagent() && !self.is_side_question && self.send_to_subagent(window, cx) {
             return;
         }
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
@@ -8084,6 +8357,9 @@ impl ThreadView {
     }
 
     fn is_subagent_running(&self, cx: &App) -> bool {
+        if self.is_side_question {
+            return self.thread.read(cx).status() == ThreadStatus::Generating;
+        }
         // A relayed message resumes an agent whose spawning tool call completed
         // long ago, so that call's status says "done" for the entire time the
         // agent is working on the reply. Awaiting a relay is the only signal
@@ -8212,7 +8488,7 @@ impl ThreadView {
         // is delivered by the parent calling `SendMessage`, which addresses a
         // team member by name, so an unnamed subagent has nothing to send to
         // and its composer would swallow whatever was typed.
-        if self.is_subagent() && self.relay_address(cx).is_none() {
+        if self.is_subagent() && !self.is_side_question && self.relay_address(cx).is_none() {
             return h_flex()
                 .px_2()
                 .py_1()
@@ -11797,6 +12073,7 @@ impl ThreadView {
 
                 ContextMenu::build(window, cx, move |menu, _, cx| {
                     let this = entity.read(cx);
+                    let can_ask_side_question = this.can_ask_side_question(cx);
                     let is_at_top = this.list_state.logical_scroll_top().item_ix == 0;
                     let markdown = markdown.as_ref().map(|markdown| markdown.read(cx));
                     let context_menu_link =
@@ -11856,7 +12133,34 @@ impl ThreadView {
                             }
                         });
 
+                    let side_question_selection =
+                        selected_text.clone().filter(|_| can_ask_side_question);
+
                     menu.when_some(focus, |menu, focus| menu.context(focus))
+                        .when_some(side_question_selection, |menu, selection| {
+                            menu.entry("Explain This", None, {
+                                let entity = entity.clone();
+                                let selection = selection.clone();
+                                move |window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.ask_side_question(
+                                            side_questions::explain_selection_question(&selection),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            })
+                            .entry("Ask About This…", None, {
+                                let entity = entity.clone();
+                                move |window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.draft_side_question_about(&selection, window, cx);
+                                    });
+                                }
+                            })
+                            .separator()
+                        })
                         .when_some(context_menu_link, |menu, url| {
                             menu.entry("Copy Link", None, move |_, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(url.to_string()));
@@ -17446,6 +17750,7 @@ impl Render for ThreadView {
             )
             .children(self.render_token_limit_callout(cx))
             .children(self.render_request_elicitations(cx))
+            .children(self.render_side_questions(cx))
             .children(self.render_read_aloud_mini_player(cx))
             .child(self.render_message_editor(window, cx))
     }
