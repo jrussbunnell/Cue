@@ -6024,16 +6024,27 @@ impl Window {
                     let source = if let Some(drag) = cx.active_drag_cursor_style() {
                         format!("active drag ({drag:?})")
                     } else {
-                        let winner = self.rendered_frame.cursor_styles.iter().rev().find(|request| {
-                            request.hitbox_id.is_none_or(|id| id.is_hovered_ignoring_last_input(self))
-                        });
+                        let winner =
+                            self.rendered_frame
+                                .cursor_styles
+                                .iter()
+                                .rev()
+                                .find(|request| {
+                                    request
+                                        .hitbox_id
+                                        .is_none_or(|id| id.is_hovered_ignoring_last_input(self))
+                                });
                         match winner {
                             None => "no request (default arrow)".to_string(),
                             Some(request) => match request.hitbox_id {
                                 None => "window-level request".to_string(),
                                 Some(id) => format!(
                                     "hitbox {:?}",
-                                    self.rendered_frame.hitboxes.iter().find(|h| h.id == id).map(|h| h.bounds)
+                                    self.rendered_frame
+                                        .hitboxes
+                                        .iter()
+                                        .find(|h| h.id == id)
+                                        .map(|h| h.bounds)
                                 ),
                             },
                         }

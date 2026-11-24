@@ -354,7 +354,11 @@ impl McpServerTool for Type {
         Ok(text(format!(
             "{clicked}, typed {} characters{}",
             input.text.chars().count(),
-            if input.submit { " and pressed Return" } else { "" }
+            if input.submit {
+                " and pressed Return"
+            } else {
+                ""
+            }
         )))
     }
 }

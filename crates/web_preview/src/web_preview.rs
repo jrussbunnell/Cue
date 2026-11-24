@@ -231,7 +231,10 @@ mod tests {
         assert_eq!(normalize_url("  "), None);
         assert_eq!(normalize_url("file:///etc/passwd"), None);
         assert_eq!(normalize_url("FTP://example.com"), None);
-        assert_eq!(normalize_url("About:Blank"), Some("about:blank".to_string()));
+        assert_eq!(
+            normalize_url("About:Blank"),
+            Some("about:blank".to_string())
+        );
         assert_eq!(
             normalize_url("data:text/html,hi"),
             Some("http://data:text/html,hi".to_string())

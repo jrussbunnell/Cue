@@ -19,7 +19,8 @@ use zed_actions::web_preview::OpenUrl;
 
 use crate::native::NativeWebView;
 use crate::{
-    ConsoleBuffer, ConsoleEntry, DEFAULT_URL, Open, OpenInBrowser, PageMessage, ToggleInspector, agent_tools, normalize_url,
+    ConsoleBuffer, ConsoleEntry, DEFAULT_URL, Open, OpenInBrowser, PageMessage, ToggleInspector,
+    agent_tools, normalize_url,
 };
 
 /// Ignore the page's own focus report for this long after an agent click, so
@@ -399,20 +400,14 @@ impl Render for WebPreview {
                     .child(div().flex_1().child(self.url_editor.clone()))
                     .child(
                         IconButton::new("inspector", IconName::Code)
-                            .tooltip(Tooltip::for_action_title(
-                                "Web Inspector",
-                                &ToggleInspector,
-                            ))
+                            .tooltip(Tooltip::for_action_title("Web Inspector", &ToggleInspector))
                             .on_click(cx.listener(|this, _, _, _| {
                                 this.native.toggle_inspector().log_err();
                             })),
                     )
                     .child(
                         IconButton::new("open-in-browser", IconName::ArrowUpRight)
-                            .tooltip(Tooltip::for_action_title(
-                                "Open in Browser",
-                                &OpenInBrowser,
-                            ))
+                            .tooltip(Tooltip::for_action_title("Open in Browser", &OpenInBrowser))
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(OpenInBrowser), cx)
                             }),
